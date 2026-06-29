@@ -1,0 +1,27 @@
+# Secrets & credentials
+config/.env
+
+# Runtime database
+db/*.sqlite
+db/*.db
+db/*.db-shm
+db/*.db-wal
+
+# Logs
+logs/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Status file (runtime state)
+config/build_status.json
