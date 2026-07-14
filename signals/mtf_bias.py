@@ -20,13 +20,14 @@ from signals.pipeline import SMCAnalysisResult
 
 @dataclass
 class MTFBias:
-    """Encapsulates the multi-timeframe bias alignment across 1D, 4H, and 1H.
+    """Encapsulates the multi-timeframe bias alignment across 4H, 1H, and 15m.
 
     Attributes:
-        daily_bias: Bias extracted from the daily (1D) timeframe.
+        daily_bias: Bias extracted from the daily (1D) timeframe (kept for reference).
         h4_bias: Bias extracted from the 4-hour (4H) timeframe.
         h1_bias: Bias extracted from the 1-hour (1H) timeframe.
-        aligned: True when all three timeframes agree on a directional bias.
+        m15_bias: Bias extracted from the 15-minute (15m) timeframe.
+        aligned: True when all three scalping TFs (4H/1H/15m) agree on direction.
         dominant_direction: 'bullish', 'bearish', or 'conflicting'.
         strength: Alignment strength from 0.0 to 1.0.
             1.0  → all 3 aligned
@@ -39,10 +40,11 @@ class MTFBias:
     daily_bias: Bias
     h4_bias: Bias
     h1_bias: Bias
-    aligned: bool
-    dominant_direction: str  # 'bullish', 'bearish', or 'conflicting'
-    strength: float          # 0.0–1.0
-    summary: str
+    m15_bias: Bias = Bias.UNKNOWN
+    aligned: bool = False
+    dominant_direction: str = "conflicting"
+    strength: float = 0.0
+    summary: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -105,8 +107,13 @@ def check_mtf_bias(results: dict[str, SMCAnalysisResult]) -> MTFBias:
     h4_bias    = _extract("4h")
     h1_bias    = _extract("1h")
 
-    biases = [daily_bias, h4_bias, h1_bias]
-    tf_labels = {"1d": daily_bias, "4h": h4_bias, "1h": h1_bias}
+    # Scalping MTF stack: 4h → 1h → 15m (1d is too slow for scalp entries)
+    # We still read all TFs but weight the scalping-relevant ones
+    m15_bias   = _extract("15m")
+
+    # Use 4h/1h/15m for alignment — drop 1d for scalping
+    biases = [h4_bias, h1_bias, m15_bias]
+    tf_labels = {"4h": h4_bias, "1h": h1_bias, "15m": m15_bias}
 
     # -- Count directional votes ----------------------------------------------
     bullish_count = sum(1 for b in biases if b is Bias.BULLISH)
@@ -150,15 +157,16 @@ def check_mtf_bias(results: dict[str, SMCAnalysisResult]) -> MTFBias:
     summary = _build_summary(
         aligned=aligned,
         dominant_direction=dominant_direction,
-        daily_bias=daily_bias,
         h4_bias=h4_bias,
         h1_bias=h1_bias,
+        m15_bias=m15_bias,
     )
 
     return MTFBias(
         daily_bias=daily_bias,
         h4_bias=h4_bias,
         h1_bias=h1_bias,
+        m15_bias=m15_bias,
         aligned=aligned,
         dominant_direction=dominant_direction,
         strength=round(strength, 2),
@@ -170,37 +178,37 @@ def _build_summary(
     *,
     aligned: bool,
     dominant_direction: str,
-    daily_bias: Bias,
     h4_bias: Bias,
     h1_bias: Bias,
+    m15_bias: Bias,
 ) -> str:
     """Return a human-readable one-liner describing the MTF alignment state.
 
     Args:
-        aligned: Whether all three timeframes are in agreement.
+        aligned: Whether all three scalping TFs (4H/1H/15m) are in agreement.
         dominant_direction: 'bullish', 'bearish', or 'conflicting'.
-        daily_bias: Bias from the 1D timeframe.
         h4_bias: Bias from the 4H timeframe.
         h1_bias: Bias from the 1H timeframe.
+        m15_bias: Bias from the 15m timeframe.
 
     Returns:
         A concise summary string with an emoji prefix.
     """
     if aligned and dominant_direction == "bullish":
-        return "\u2705 MTF ALIGNED BULLISH (1D+4H+1H)"
+        return "✅ MTF ALIGNED BULLISH (4H+1H+15m)"
 
     if aligned and dominant_direction == "bearish":
-        return "\u2705 MTF ALIGNED BEARISH (1D+4H+1H)"
+        return "✅ MTF ALIGNED BEARISH (4H+1H+15m)"
 
     if dominant_direction == "conflicting":
-        return "\u274c MTF CONFLICTING \u2014 no dominant direction"
+        return "❌ MTF CONFLICTING — no dominant direction"
 
     # Mixed — show per-timeframe breakdown
-    d_str  = daily_bias.name
-    h4_str = h4_bias.name
-    h1_str = h1_bias.name
+    h4_str  = h4_bias.name
+    h1_str  = h1_bias.name
+    m15_str = m15_bias.name
     return (
-        f"\u26a0\ufe0f MTF MIXED: 1D={d_str}, 4H={h4_str}, 1H={h1_str}"
+        f"⚠️ MTF MIXED: 4H={h4_str}, 1H={h1_str}, 15m={m15_str}"
     )
 
 
@@ -230,6 +238,7 @@ def mtf_bias_to_dict(bias: MTFBias) -> dict:
         "daily_bias":          bias.daily_bias.name,
         "h4_bias":             bias.h4_bias.name,
         "h1_bias":             bias.h1_bias.name,
+        "m15_bias":            bias.m15_bias.name,
         "aligned":             bias.aligned,
         "dominant_direction":  bias.dominant_direction,
         "strength":            bias.strength,

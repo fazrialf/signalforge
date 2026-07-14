@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from signals.llm_engine import SignalResult
+from config.settings import BASE_RISK_PCT, MID_RISK_PCT, HIGH_RISK_PCT
 
 logger = logging.getLogger(__name__)
 
@@ -98,13 +99,13 @@ def calc_position_size(
     Raises:
         ValueError: If ``entry == stop_loss`` (zero-distance stop).
     """
-    # Determine risk tier
+    # Determine risk tier from settings constants
     if confidence >= 90:
-        risk_pct = 2.0
+        risk_pct = HIGH_RISK_PCT
     elif confidence >= 80:
-        risk_pct = 1.5
+        risk_pct = MID_RISK_PCT
     else:
-        risk_pct = 1.0
+        risk_pct = BASE_RISK_PCT
 
     # Honour caller-supplied clamps
     risk_pct = max(min_risk_pct, min(max_risk_pct, risk_pct))

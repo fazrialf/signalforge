@@ -43,7 +43,7 @@ from trading.paper_trade import PaperTradeEngine
 from config.assets import PAPER_MODE, get_enabled_assets
 from monitoring.error_alerter import ErrorAlerter
 from monitoring.health_endpoint import HealthServer
-from config.settings import MIN_CONFLUENCE_SCORE, MIN_LLM_CONFIDENCE, MIN_RR_RATIO, ACCOUNT_BALANCE, DB_PATH, LOG_PATH, BASE_DIR
+from config.settings import MIN_CONFLUENCE_SCORE, MIN_LLM_CONFIDENCE, MIN_RR_RATIO, ACCOUNT_BALANCE, COOLDOWN_MINUTES, SWING_LOOKBACK, DB_PATH, LOG_PATH, BASE_DIR
 try:
     from external.news_fetcher import fetch_recent_news, is_high_impact_news
     from external.fear_greed import fetch_fear_greed
@@ -177,10 +177,11 @@ async def main():
 
     # --- SMC Analysis Pipeline ---
     # Run analysis every 60 seconds on latest data
-    last_structure_broadcast = 0
+    # M-5: per-symbol broadcast timer (was a single shared value — starved non-BTC assets)
+    last_structure_broadcast: dict[str, float] = {}
 
     async def run_smc_pipeline():
-        nonlocal last_structure_broadcast, latest_prices
+        nonlocal last_structure_broadcast, latest_prices, active_positions
         while True:
             try:
                 # Iterate over every enabled asset
@@ -223,8 +224,8 @@ async def main():
 
                     # Broadcast a readable snapshot every ~10 minutes (per asset)
                     now = time.time()
-                    if now - last_structure_broadcast >= 600:
-                        last_structure_broadcast = now
+                    if now - last_structure_broadcast.get(symbol, 0) >= 600:
+                        last_structure_broadcast[symbol] = now
                         tf_4h = results.get("4h")
                         tf_1h = results.get("1h")
                         msg_parts = [
@@ -264,7 +265,7 @@ async def main():
                     mtf_bias = check_mtf_bias(results)
                     primary_r = results.get(primary_tf)
                     if primary_r:
-                        confluence = score_confluence(primary_r, mtf_aligned=mtf_bias.aligned)
+                        confluence = score_confluence(primary_r, mtf_aligned=mtf_bias.aligned, threshold=MIN_CONFLUENCE_SCORE)
                         logger.info(
                             "[CONFLUENCE] %s %s | net=%d | bull=%d | bear=%d | threshold=%s",
                             symbol, confluence.dominant_direction.upper(),
@@ -281,7 +282,7 @@ async def main():
                             external_data = {}
                             if _EXTERNAL_AVAILABLE:
                                 try:
-                                    external_data['fear_greed'] = fetch_fear_greed()
+                                    external_data['fear_greed'] = await asyncio.to_thread(fetch_fear_greed)  # type: ignore[name-defined]  # guarded by _EXTERNAL_AVAILABLE
                                 except Exception as e:
                                     logger.warning("[EXT] Fear & Greed fetch failed: %s", e)
                                 try:
@@ -321,6 +322,10 @@ async def main():
 
                             # --- Filter Gate ---
                             if signal.signal != "PASS":
+                                # Inject pre-fetched Fear & Greed so filter 9
+                                # doesn't make a blocking sync HTTP call
+                                if _EXTERNAL_AVAILABLE and 'fear_greed' in external_data:
+                                    filter_gate.set_fear_greed(external_data['fear_greed'])
                                 filter_result = filter_gate.apply(
                                     signal=signal,
                                     mtf_bias=mtf_bias,
@@ -335,18 +340,12 @@ async def main():
                                     symbol, filter_str,
                                 )
 
-                                # Log every signal regardless of outcome
-                                log_signal(
-                                    signal=signal,
-                                    symbol=symbol,
-                                    confluence_score=confluence.net_score,
-                                    mtf_aligned=mtf_bias.aligned,
-                                    filter_result=filter_str,
-                                    cooldown_remaining=cooldown_tracker.time_remaining(symbol),
-                                    db_path=str(DB_PATH),
-                                )
-
+                                # M-2: log_signal called once only — after filter decision
                                 if filter_result.passed:
+                                    # C-3: guard against entry==stop_loss crash
+                                    if not signal.is_actionable:
+                                        logger.warning("[RISK] Signal not actionable — skipping position sizing")
+                                        continue
                                     # Calculate position size before delivery
                                     pos_size = calc_position_size(
                                         account_balance=ACCOUNT_BALANCE,
@@ -380,9 +379,8 @@ async def main():
                                             cooldown_remaining=0,
                                             db_path=str(DB_PATH),
                                         )
-
                                         # --- Paper or Live Position ---
-                                        if PAPER_MODE:
+                                        if PAPER_MODE and paper_engine is not None:
                                             paper_id = paper_engine.open_trade(
                                                 symbol=symbol,
                                                 direction="LONG" if signal.signal == "BUY" else "SHORT",
@@ -451,14 +449,25 @@ async def main():
                         await asyncio.sleep(3)
 
                 # --- GAP FILL: Paper Engine Auto-Tick ---
+                # C-5: prune active_positions for any symbols the paper engine just closed
+                closed_symbols: set[str] = set()
                 for asset in enabled_assets:
                     try:
+                        if paper_engine is None:
+                            break
                         ticks = paper_engine.tick(asset.symbol, latest_prices.get(asset.symbol, 0))
                         if ticks:
                             for t in ticks:
-                                logger.info("[PAPER] %s auto-closed: %s P&L=${%.2f}", t.get("symbol", asset), t.get("reason", "?"), t.get("pnl_usd", 0))
+                                reason = t.get("reason", "?")
+                                pnl = t.get("pnl_usd", 0)
+                                logger.info("[PAPER] %s auto-closed: %s P&L=$%.2f", asset.symbol, reason, pnl)
+                                closed_symbols.add(asset.symbol)
                     except Exception as tick_err:
                         logger.warning("[PAPER] tick error for %s: %s", asset, tick_err)
+                # Remove closed symbols from active_positions so FilterGate heat check stays accurate
+                if closed_symbols:
+                    active_positions = [p for p in active_positions if p.get("symbol") not in closed_symbols]
+                    logger.debug("[C-5] Pruned active_positions — removed %d closed: %s", len(closed_symbols), closed_symbols)
 
                 logger.info("SMC analysis cycle complete for all %d assets.", len(enabled_assets))
                 health_server.set_health("pipeline", "ok", f"Cycle complete, {len(enabled_assets)} assets analyzed")
@@ -470,8 +479,9 @@ async def main():
             await asyncio.sleep(60)
 
     # --- Filter Gate + Risk Sizing ---
+    # M-1: was hardcoded 30 — now reads COOLDOWN_MINUTES from settings
     cooldown_tracker = CooldownTracker(
-        default_cooldown_minutes=30,
+        default_cooldown_minutes=COOLDOWN_MINUTES,
         db_path=str(DB_PATH),
     )
     filter_gate = FilterGate(
@@ -483,7 +493,7 @@ async def main():
             'max_heat': 6.0,
         },
     )
-    active_positions: list[dict] = []   # updated when signals are delivered
+    active_positions: list[dict] = []   # C-5: pruned on each cycle — entries removed when paper engine closes them
 
     # --- Position Tracker + Command Handler ---
     position_tracker = PositionTracker(db_path=str(DB_PATH))
@@ -494,9 +504,12 @@ async def main():
     )
 
     # --- Paper Trading Engine ---
-    paper_engine = PaperTradeEngine(db_path=str(DB_PATH), initial_balance=10000.0)
+    # Q-5: only instantiate when PAPER_MODE is enabled — avoids DB schema init in live mode
     if PAPER_MODE:
+        paper_engine = PaperTradeEngine(db_path=str(DB_PATH), initial_balance=10000.0)
         logger.info("PAPER MODE enabled — signals simulated, no real orders")
+    else:
+        paper_engine = None
 
     # --- Error Alerter + Health Endpoint ---
     alerter = ErrorAlerter(
@@ -534,7 +547,7 @@ async def main():
 
     # Keep running (WebSocket + watchdog + SMC run forever)
     try:
-        await asyncio.gather(watchdog_task, smc_task, polling_task)
+        await asyncio.gather(watchdog_task, smc_task, polling_task, health_task, monitor_task)
     except asyncio.CancelledError:
         logger.info("Shutting down...")
     finally:

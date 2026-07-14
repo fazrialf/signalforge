@@ -21,6 +21,19 @@ from config.settings import (
 
 logger = logging.getLogger(__name__)
 
+# C-4: singleton client — created once, never leaked
+_openai_client: AsyncOpenAI | None = None
+
+def _get_client() -> AsyncOpenAI:
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = AsyncOpenAI(
+            api_key=OPENAI_API_KEY,
+            base_url=OPENAI_BASE_URL,
+            timeout=LLM_TIMEOUT,
+        )
+    return _openai_client
+
 # Required keys in the LLM JSON response
 _REQUIRED_KEYS = {"signal", "confidence", "entry", "stop_loss", "tp1", "tp2", "tp3", "reasoning", "key_risk", "rr_ratio"}
 _VALID_SIGNALS = {"BUY", "SELL", "PASS"}
@@ -134,29 +147,83 @@ def _parse_llm_response(raw: str, model: str, latency_ms: int) -> SignalResult:
                 logger.warning(f"[LLM] JSON parse error: {e} | context: {repr(json_str[max(0,e.pos-40):e.pos+40])}")
                 return _pass_result(f"JSON parse error: {e}", model, latency_ms, raw)
 
-    # Validate required keys
+    # Auto-fill missing keys where possible before hard-failing
     missing = _REQUIRED_KEYS - set(data.keys())
     if missing:
         logger.warning(f"[LLM] Missing keys in response: {missing}")
-        return _pass_result(f"Missing keys: {missing}", model, latency_ms, raw)
+        # Compute rr_ratio from entry/stop_loss/tp1 if available
+        if "rr_ratio" in missing:
+            try:
+                entry = float(data.get("entry", 0))
+                sl = float(data.get("stop_loss", 0))
+                tp1 = float(data.get("tp1", 0))
+                if entry and sl and tp1 and entry != sl:
+                    sig = str(data.get("signal", "BUY")).upper()
+                    if sig == "BUY":
+                        data["rr_ratio"] = (tp1 - entry) / (entry - sl)
+                    else:
+                        data["rr_ratio"] = (entry - tp1) / (tp1 - sl) if tp1 != sl else 0.0
+                    missing.discard("rr_ratio")
+                    logger.info("[LLM] rr_ratio computed from entry/sl/tp1")
+            except Exception:
+                data["rr_ratio"] = 0.0
+                missing.discard("rr_ratio")
+        # Default tp3 to tp2 if only tp3 is missing
+        if "tp3" in missing and "tp2" in data:
+            data["tp3"] = data["tp2"]
+            missing.discard("tp3")
+            logger.info("[LLM] tp3 defaulted to tp2")
+        # Default tp2/tp3 from tp1 if both are missing (model only returned tp1)
+        if "tp2" in missing and "tp1" in data:
+            tp1 = float(data.get("tp1", 0))
+            entry = float(data.get("entry", 0))
+            sig = str(data.get("signal", "BUY")).upper()
+            if tp1 and entry:
+                diff = abs(tp1 - entry)
+                data["tp2"] = tp1 + diff if sig == "BUY" else tp1 - diff
+                missing.discard("tp2")
+                logger.info("[LLM] tp2 projected from tp1 distance")
+        if "tp3" in missing and "tp2" in data:
+            tp2 = float(data.get("tp2", 0))
+            tp1 = float(data.get("tp1", 0))
+            if tp2 and tp1:
+                diff = abs(tp2 - tp1)
+                sig = str(data.get("signal", "BUY")).upper()
+                data["tp3"] = tp2 + diff if sig == "BUY" else tp2 - diff
+                missing.discard("tp3")
+                logger.info("[LLM] tp3 projected from tp2 distance")
+        # Default text fields to empty string
+        for key in ("reasoning", "key_risk"):
+            if key in missing:
+                data[key] = ""
+                missing.discard(key)
+                logger.info(f"[LLM] {key} defaulted to empty string")
+        # Still missing something non-recoverable
+        if missing:
+            logger.warning(f"[LLM] Unrecoverable missing keys: {missing}")
+            return _pass_result(f"Missing keys: {missing}", model, latency_ms, raw)
 
     signal = str(data.get("signal", "PASS")).upper()
     if signal not in _VALID_SIGNALS:
         signal = "PASS"
 
+    def _f(val, default=0.0) -> float:
+        """Coerce LLM numeric field — handles None/null gracefully."""
+        return float(val) if val is not None else default
+
     try:
         return SignalResult(
             signal=signal,
-            confidence=float(data.get("confidence", 0)),
-            entry=float(data.get("entry", 0)),
-            stop_loss=float(data.get("stop_loss", 0)),
-            tp1=float(data.get("tp1", 0)),
-            tp2=float(data.get("tp2", 0)),
-            tp3=float(data.get("tp3", 0)),
-            reasoning=str(data.get("reasoning", "")),
-            key_risk=str(data.get("key_risk", "")),
-            timeframe=str(data.get("timeframe", "1h")),
-            rr_ratio=float(data.get("rr_ratio", 0)),
+            confidence=_f(data.get("confidence"), 0),
+            entry=_f(data.get("entry"), 0),
+            stop_loss=_f(data.get("stop_loss"), 0),
+            tp1=_f(data.get("tp1"), 0),
+            tp2=_f(data.get("tp2"), 0),
+            tp3=_f(data.get("tp3"), 0),
+            reasoning=str(data.get("reasoning") or ""),
+            key_risk=str(data.get("key_risk") or ""),
+            timeframe=str(data.get("timeframe") or "1h"),
+            rr_ratio=_f(data.get("rr_ratio"), 0),
             model_used=model,
             prompt_version=LLM_PROMPT_VERSION,
             latency_ms=latency_ms,
@@ -199,14 +266,12 @@ async def call_llm(
     Returns a SignalResult — never raises.
     """
     model = model or OPENAI_MODEL
-    client = AsyncOpenAI(
-        api_key=OPENAI_API_KEY,
-        base_url=OPENAI_BASE_URL,
-        timeout=LLM_TIMEOUT,
-    )
+    client = _get_client()  # C-4: reuse singleton, no leak
 
     for attempt in range(LLM_MAX_RETRIES + 1):
-        current_model = model if attempt < LLM_MAX_RETRIES else OPENAI_FALLBACK
+        # M-6: was `attempt < LLM_MAX_RETRIES` — gave primary only 2 of 3 attempts.
+        # Fallback fires on the last attempt only (attempt == LLM_MAX_RETRIES).
+        current_model = OPENAI_FALLBACK if attempt == LLM_MAX_RETRIES else model
         t0 = time.monotonic()
         try:
             logger.info(f"[LLM] Calling {current_model} (attempt {attempt + 1})...")
@@ -217,7 +282,7 @@ async def call_llm(
                     {"role": "user", "content": user_prompt},
                 ],
                 temperature=temperature,
-                max_tokens=1024,
+                max_tokens=2048,
             )
             latency_ms = int((time.monotonic() - t0) * 1000)
             raw = response.choices[0].message.content or ""

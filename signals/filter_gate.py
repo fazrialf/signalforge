@@ -19,6 +19,8 @@ from config.settings import (
     MIN_RR_RATIO,
     MAX_CONCURRENT,
     MAX_PORTFOLIO_HEAT_PCT,
+    DAILY_LOSS_LIMIT_PCT,
+    ACCOUNT_BALANCE,
 )
 try:
     from external.fear_greed import fetch_fear_greed
@@ -101,6 +103,14 @@ class FilterGate:
         self.max_active_signals: int = self.config.get("max_active_signals", MAX_CONCURRENT)
         self.max_portfolio_heat_pct: float = self.config.get("max_heat", MAX_PORTFOLIO_HEAT_PCT)
 
+        # Fear & Greed cache — pre-fetched async in main.py and injected here
+        # to avoid a blocking sync HTTP call inside the async pipeline.
+        self._fear_greed_cache: Optional[dict] = None
+
+    def set_fear_greed(self, fg: dict) -> None:
+        """Inject a pre-fetched Fear & Greed result for filter 9."""
+        self._fear_greed_cache = fg
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -139,6 +149,7 @@ class FilterGate:
             or self._f4_cooldown(symbol)
             or self._f5_max_active(active_positions)
             or self._f6_portfolio_heat(active_positions)
+            or self._f6b_daily_loss_limit(active_positions)
             or self._f7_news_stub()
             or self._f8_volatility_stub()
             or self._f9_fear_greed_stub()
@@ -288,12 +299,15 @@ class FilterGate:
 
         Blocks signals when market sentiment is at dangerous extremes
         (value < 10 = Extreme Fear, > 90 = Extreme Greed).
-        Requires external.fear_greed module.
+        Uses pre-fetched cache injected via set_fear_greed() to avoid
+        blocking the async pipeline with a sync HTTP call.
         """
         if not _EXTERNAL_DATA_AVAILABLE:
             return None
+        fg = self._fear_greed_cache
+        if fg is None:
+            return None  # No data available — skip filter rather than block
         try:
-            fg = fetch_fear_greed()
             if fg.get("is_extreme", False):
                 val = fg.get("value", 50)
                 cls = fg.get("classification", "Unknown")
@@ -312,4 +326,29 @@ class FilterGate:
         Always passes until Sprint 7 adds live order-book spread monitoring.
         """
         # TODO Sprint 7: block if (ask - bid) / mid_price > MAX_SPREAD_PCT
+        return None
+
+    def _f6b_daily_loss_limit(
+        self, active_positions: list[dict]
+    ) -> Optional[FilterResult]:
+        """Circuit breaker: block new signals if daily realised loss exceeds limit.
+
+        Reads 'realised_pnl' from each closed position dict for today.
+        Blocks when total loss >= DAILY_LOSS_LIMIT_PCT of ACCOUNT_BALANCE.
+        """
+        daily_limit_usd = ACCOUNT_BALANCE * (DAILY_LOSS_LIMIT_PCT / 100)
+        today_loss = sum(
+            p.get("realised_pnl", 0.0)
+            for p in active_positions
+            if p.get("realised_pnl", 0.0) < 0
+        )
+        if abs(today_loss) >= daily_limit_usd:
+            return FilterResult(
+                passed=False,
+                reason=(
+                    f"Daily loss limit reached: ${abs(today_loss):.2f} >= "
+                    f"${daily_limit_usd:.2f} ({DAILY_LOSS_LIMIT_PCT}% of balance)"
+                ),
+                filter_name="filter_6b_daily_loss_limit",
+            )
         return None

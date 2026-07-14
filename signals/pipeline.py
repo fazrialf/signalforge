@@ -295,7 +295,7 @@ def analyse_all_timeframes(
         elif tf in ("15m", "30m"):
             lb = 4
         else:
-            lb = 3  # 1m, 5m
+            lb = 3  # 1m, 5m — matches SWING_LOOKBACK=3 in config/settings.py (scalping default)
 
         if len(df) < lb * 3:
             logger.warning("Not enough data for %s to run SMC analysis (%d bars, need %d)",

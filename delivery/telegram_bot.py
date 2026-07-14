@@ -5,7 +5,7 @@ Handles all outbound messages to the user.
 import asyncio
 import aiohttp
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +15,19 @@ class TelegramBot:
         self.token   = token
         self.chat_id = chat_id
         self.base    = f"https://api.telegram.org/bot{token}"
+        self._session: aiohttp.ClientSession | None = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Return the persistent session, creating it if necessary."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def close(self) -> None:
+        """Close the persistent session on shutdown."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
 
     async def send(self, text: str, parse_mode: str = "HTML") -> bool:
         """Send a message. Returns True on success."""
@@ -25,13 +38,13 @@ class TelegramBot:
             "parse_mode": parse_mode,
         }
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        return True
-                    body = await resp.text()
-                    logger.error("Telegram send failed %s: %s", resp.status, body)
-                    return False
+            session = await self._get_session()
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    return True
+                body = await resp.text()
+                logger.error("Telegram send failed %s: %s", resp.status, body)
+                return False
         except Exception as e:
             logger.error("Telegram exception: %s", e)
             return False
@@ -41,12 +54,12 @@ class TelegramBot:
         url = f"{self.base}/getUpdates"
         params = {"offset": offset, "timeout": timeout, "allowed_updates": ["message"]}
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=timeout + 5)) as resp:
-                    if resp.status != 200:
-                        return []
-                    data = await resp.json()
-                    return data.get("result", [])
+            session = await self._get_session()
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=timeout + 5)) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+                return data.get("result", [])
         except Exception as e:
             logger.error("Telegram getUpdates exception: %s", e)
             return []
@@ -161,7 +174,7 @@ class TelegramBot:
         text = (
             f"\u26a0\ufe0f <b>SignalForge Alert</b>\n"
             f"{issue}\n"
-            f"<i>{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}</i>"
+            f"<i>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</i>"
         )
         return await self.send(text)
 
@@ -174,7 +187,7 @@ class TelegramBot:
 
         text = (
             f"✅ <b>SignalForge Status</b> — "
-            f"{datetime.utcnow().strftime('%d %b %Y %H:%M')} UTC\n"
+            f"{datetime.now(timezone.utc).strftime('%d %b %Y %H:%M')} UTC\n"
             f"────────────────────\n"
             f"Uptime: <b>{uptime_h:.1f}h</b>\n"
             f"WebSocket: {ws_icon}  LLM API: {llm_icon}  News: {news_icon}\n"

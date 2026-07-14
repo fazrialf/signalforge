@@ -54,14 +54,16 @@ class DataFetcher:
 
     async def _store_ohlcv(self, timeframe: str, df: pd.DataFrame):
         """Upsert candles to SQLite."""
-        rows = []
-        for ts, row in df.iterrows():
-            rows.append((
-                self.symbol, timeframe,
-                int(ts.timestamp() * 1000),
-                row["open"], row["high"], row["low"],
-                row["close"], row["volume"]
-            ))
+        rows = list(zip(
+            [self.symbol] * len(df),
+            [timeframe]   * len(df),
+            (df.index.astype("int64") // 10**6).tolist(),  # ms timestamps
+            df["open"].tolist(),
+            df["high"].tolist(),
+            df["low"].tolist(),
+            df["close"].tolist(),
+            df["volume"].tolist(),
+        ))
         conn = get_conn()
         conn.executemany(
             """

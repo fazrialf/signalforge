@@ -7,9 +7,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 from core.swing_points import SwingPoint, detect_swing_points
+from config.settings import IMPULSE_ATR_MULT
 
 logger = logging.getLogger(__name__)
 
@@ -96,32 +98,37 @@ def analyse_structure(df: pd.DataFrame,
             structure_breaks=[], swing_points=swings
         )
 
-    closes = df["close"].values
+    closes = df["close"].to_numpy(dtype=float)
+    highs  = df["high"].to_numpy(dtype=float)
+    lows   = df["low"].to_numpy(dtype=float)
+
+    # --- ATR for impulse/displacement filter ---
+    # A BOS must be accompanied by displacement ≥ IMPULSE_ATR_MULT × ATR
+    # to filter shallow, low-energy breaks that don't represent real structure.
+    tr = np.maximum(
+        highs[1:] - lows[1:],
+        np.maximum(
+            np.abs(highs[1:] - closes[:-1]),
+            np.abs(lows[1:]  - closes[:-1]),
+        )
+    )
+    atr14 = float(np.mean(tr[-14:])) if len(tr) >= 14 else float(np.mean(tr)) if len(tr) > 0 else 0.0
+    impulse_min = atr14 * IMPULSE_ATR_MULT
 
     # --- Separate highs and lows ---
     s_highs = [p for p in swings if p.type == "high"]
     s_lows  = [p for p in swings if p.type == "low"]
 
+    # --- Detect BOS / ChOS (single left-to-right pass — no look-ahead bias) ---
+    # Labels are initialised to None and updated only as we advance through
+    # swings. Pre-scanning the full array would stamp future swing labels onto
+    # past bars, making back-of-dataset breaks use information that wasn't yet
+    # available — invalid in live trading.
     last_hh: Optional[SwingPoint] = None
     last_hl: Optional[SwingPoint] = None
     last_lh: Optional[SwingPoint] = None
     last_ll: Optional[SwingPoint] = None
 
-    # Label highs
-    for i in range(1, len(s_highs)):
-        if s_highs[i].price > s_highs[i - 1].price:
-            last_hh = s_highs[i]
-        else:
-            last_lh = s_highs[i]
-
-    # Label lows
-    for i in range(1, len(s_lows)):
-        if s_lows[i].price > s_lows[i - 1].price:
-            last_hl = s_lows[i]
-        else:
-            last_ll = s_lows[i]
-
-    # --- Detect BOS / ChOS ---
     breaks: list[StructureBreak] = []
     current_bias = Bias.UNKNOWN
 
@@ -132,27 +139,30 @@ def analyse_structure(df: pd.DataFrame,
         if current_bias in (Bias.BULLISH, Bias.UNKNOWN):
             # Bullish trend: watch for bearish BOS (break below last HL)
             if last_hl and p.type == "low" and bar_close < last_hl.price:
-                # Was it a higher low before? Then this is ChOS (reversal)
-                event = StructureEvent.CHOS_BEAR if current_bias == Bias.BULLISH else StructureEvent.BOS_BEAR
-                breaks.append(StructureBreak(
-                    event=event, bar_index=p.index,
-                    timestamp=p.timestamp,
-                    broke_level=last_hl.price,
-                    close_price=float(bar_close)
-                ))
-                current_bias = Bias.BEARISH
+                displacement = abs(last_hl.price - bar_close)
+                if displacement >= impulse_min:
+                    event = StructureEvent.CHOS_BEAR if current_bias == Bias.BULLISH else StructureEvent.BOS_BEAR
+                    breaks.append(StructureBreak(
+                        event=event, bar_index=p.index,
+                        timestamp=p.timestamp,
+                        broke_level=last_hl.price,
+                        close_price=float(bar_close)
+                    ))
+                    current_bias = Bias.BEARISH
 
         if current_bias in (Bias.BEARISH, Bias.UNKNOWN):
             # Bearish trend: watch for bullish BOS (break above last LH)
             if last_lh and p.type == "high" and bar_close > last_lh.price:
-                event = StructureEvent.CHOS_BULL if current_bias == Bias.BEARISH else StructureEvent.BOS_BULL
-                breaks.append(StructureBreak(
-                    event=event, bar_index=p.index,
-                    timestamp=p.timestamp,
-                    broke_level=last_lh.price,
-                    close_price=float(bar_close)
-                ))
-                current_bias = Bias.BULLISH
+                displacement = abs(bar_close - last_lh.price)
+                if displacement >= impulse_min:
+                    event = StructureEvent.CHOS_BULL if current_bias == Bias.BEARISH else StructureEvent.BOS_BULL
+                    breaks.append(StructureBreak(
+                        event=event, bar_index=p.index,
+                        timestamp=p.timestamp,
+                        broke_level=last_lh.price,
+                        close_price=float(bar_close)
+                    ))
+                    current_bias = Bias.BULLISH
 
         # Update last swing labels on the fly
         if p.type == "high":

@@ -10,7 +10,7 @@ Generates comprehensive weekly performance reports combining:
 import sqlite3
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from signals.win_rate import get_weekly_summary, get_monthly_summary
@@ -47,7 +47,7 @@ def get_filter_stats(db_path: str, days: int = 7) -> dict:
     
     try:
         # Calculate cutoff timestamp (days ago)
-        cutoff = datetime.utcnow() - timedelta(days=days)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         cutoff_str = cutoff.strftime('%Y-%m-%d %H:%M:%S')
         
         conn = sqlite3.connect(db_path)
@@ -159,7 +159,7 @@ async def send_weekly_report(db_path: str, bot) -> bool:
         logger.info("Generating weekly performance report...")
         
         # Calculate date range for report header
-        end_date = datetime.utcnow()
+        end_date = datetime.now(timezone.utc)
         start_date = end_date - timedelta(days=7)
         date_range = (
             f"{start_date.strftime('%d %b %Y')} — "
@@ -281,7 +281,7 @@ async def send_monthly_report(db_path: str, bot) -> bool:
         logger.info("Generating monthly performance report...")
         
         # Calculate date range
-        end_date = datetime.utcnow()
+        end_date = datetime.now(timezone.utc)
         start_date = end_date - timedelta(days=30)
         date_range = (
             f"{start_date.strftime('%d %b %Y')} — "

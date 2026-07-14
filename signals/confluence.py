@@ -36,8 +36,9 @@ SR_PROXIMITY_PCT = 0.005   # 0.5 %
 OB_PROXIMITY_PCT = 0.01    # 1.0 %
 FVG_PROXIMITY_PCT = 0.015  # 1.5 %
 
-# Default threshold for ``meets_threshold`` flag
-DEFAULT_THRESHOLD = 8
+# Default threshold for ``meets_threshold`` flag — kept for direct callers,
+# but main.py always passes MIN_CONFLUENCE_SCORE=6 from settings explicitly.
+DEFAULT_THRESHOLD = 6
 
 
 # ---------------------------------------------------------------------------
@@ -224,17 +225,17 @@ def score_confluence(
                      f"{fvg.direction.capitalize()} FVG "
                      f"${fvg.bottom:,.2f}–${fvg.top:,.2f} (filled {fvg.fill_pct:.0f}%)")
 
-    # 2b. Recent liquidity grab → reversal direction
+    # 2b. Liquidity grab + reversal — direction must match the grab implication
+    # sell_side grab (stop hunt below lows) → bullish reversal expected
+    # buy_side grab (stop hunt above highs) → bearish reversal expected
     if result.recent_grab:
         grab = result.recent_grab
-        # sell_side grab (swept lows) → bullish reversal
-        # buy_side grab (swept highs) → bearish reversal
         if grab.type == "sell_side":
-            direction = "bullish"
+            direction = "bullish"   # swept sell-side liquidity → expect bounce up
         elif grab.type == "buy_side":
-            direction = "bearish"
+            direction = "bearish"   # swept buy-side liquidity → expect reversal down
         else:
-            direction = "bullish"  # fallback
+            direction = "bullish"   # fallback
         _add(factors, f"liquidity_grab_{direction}", 2, direction,
              f"Liquidity grab ({grab.type}) at ${grab.price:,.2f} → {direction} reversal")
 
