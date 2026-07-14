@@ -85,6 +85,23 @@ IMPULSE_VOL_MULT  = 2.0
 MTF_STRENGTH_MIN_SWING  = 0.67
 MTF_STRENGTH_MIN_SCALP  = 0.33
 
+# --- BOS RETEST ENTRY (S-3)
+# ICT pullback model — arm on BOS, wait for price to tap FVG/OB left by
+# the impulse candle before firing the LLM. Improves entry timing vs
+# firing immediately on BOS close.
+#
+# BOS_RETEST_ENABLED              — set False to revert to legacy immediate-fire
+# BOS_RETEST_TTL_BARS             — cycles to wait before expiring ARMED state
+#                                   (1 cycle = ~60s in main loop)
+# BOS_RETEST_FVG_TOLERANCE        — max % distance from impulse close to accept FVG
+# BOS_RETEST_OB_TOLERANCE         — max % distance from impulse close to accept OB
+# BOS_RETEST_REQUIRE_REVERSAL_CANDLE — require a reversal candle at the zone before firing
+BOS_RETEST_ENABLED                 = True
+BOS_RETEST_TTL_BARS                = 20      # ~20 minutes at 1 cycle/min
+BOS_RETEST_FVG_TOLERANCE           = 0.03    # 3% from impulse close
+BOS_RETEST_OB_TOLERANCE            = 0.04    # 4% from impulse close
+BOS_RETEST_REQUIRE_REVERSAL_CANDLE = True    # require hammer/engulfing etc at zone
+
 # --- SESSION FILTER
 # Alt coins only — BTC/ETH trade 24/7. Alts blocked outside London/NY open.
 # London: 07:00–16:00 UTC. NY: 13:00–22:00 UTC. Overlap: 13:00–16:00 UTC.

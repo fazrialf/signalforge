@@ -30,6 +30,7 @@ from monitoring.watchdog import HealthWatchdog
 
 from signals.pipeline import analyse_all_timeframes
 from signals.confluence import score_confluence
+from signals.bos_retest import BOSRetestWatcher
 from signals.mtf_bias import check_mtf_bias
 from signals.prompt_builder import build_prompt
 from signals.llm_engine import get_signal
@@ -180,6 +181,9 @@ async def main():
     # M-5: per-symbol broadcast timer (was a single shared value — starved non-BTC assets)
     last_structure_broadcast: dict[str, float] = {}
 
+    # S-3: BOS retest watcher — per-symbol state machine, lives for the session
+    bos_watcher = BOSRetestWatcher()
+
     async def run_smc_pipeline():
         nonlocal last_structure_broadcast, latest_prices, active_positions
         while True:
@@ -276,6 +280,20 @@ async def main():
                         )
 
                         if confluence.meets_threshold:
+                            # S-3: BOS retest gate — suppress LLM until price
+                            # pulls back into the FVG/OB left by the BOS impulse
+                            retest_ok, retest_reason = bos_watcher.update(
+                                symbol=symbol,
+                                primary_r=primary_r,
+                                current_price=price,
+                            )
+                            if not retest_ok:
+                                logger.info(
+                                    "[BOS_RETEST] %s LLM suppressed — %s",
+                                    symbol, retest_reason,
+                                )
+                                continue
+
                             logger.info("[LLM] %s confluence threshold met — calling GPT-4o...", symbol)
 
                             # --- Fetch external data ---
@@ -367,6 +385,8 @@ async def main():
                                     await bot.send(msg)
                                     # Set cooldown + track position
                                     cooldown_tracker.set_cooldown(symbol)
+                                    # S-3: reset BOS retest watcher after delivery
+                                    bos_watcher.reset(symbol)
 
                                     # --- Track position in DB ---
                                     try:
