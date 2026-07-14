@@ -131,6 +131,26 @@ class DataFetcher:
                 return float(df["close"].iloc[-1])
         return None
 
+    def latest_candle(self) -> Optional[dict]:
+        """Return latest OHLC values from the shortest available cached TF.
+
+        Returns a dict with keys: open, high, low, close.
+        Used by PaperTradeEngine.tick() to evaluate SL/TP against wicks,
+        not just close price — prevents false wins/losses from wick-through events.
+        Returns None if no cached data is available.
+        """
+        for tf in ["1m", "5m", "15m", "1h"]:
+            df = self._cache.get(tf)
+            if df is not None and not df.empty:
+                row = df.iloc[-1]
+                return {
+                    "open":  float(row["open"]),
+                    "high":  float(row["high"]),
+                    "low":   float(row["low"]),
+                    "close": float(row["close"]),
+                }
+        return None
+
 
 if __name__ == "__main__":
     import sys, os

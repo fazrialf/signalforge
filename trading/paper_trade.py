@@ -219,27 +219,41 @@ class PaperTradeEngine:
             logger.error("[PaperTrade] open_trade failed: %s", exc)
             raise
 
-    def tick(self, symbol: str, current_price: float) -> list[dict]:
-        """Evaluate all open trades for *symbol* against *current_price*.
+    def tick(self, symbol: str, current_price: float,
+             candle_high: Optional[float] = None,
+             candle_low: Optional[float] = None) -> list[dict]:
+        """Evaluate all open trades for *symbol* against the current candle.
 
         For each open trade:
 
-        - **LONG**: ``current_price <= sl`` → ``CLOSED_LOSS``;
-          ``current_price >= tp1`` → mark ``tp1_hit``; same for ``tp2``;
-          ``current_price >= tp3`` → ``CLOSED_WIN``.
+        - **LONG**: ``candle_low <= sl`` → ``CLOSED_LOSS``;
+          ``candle_high >= tp1`` → mark ``tp1_hit``; same for ``tp2``;
+          ``candle_high >= tp3`` → ``CLOSED_WIN``.
         - **SHORT**: inverse comparisons.
+        - When ``candle_high``/``candle_low`` are provided (M-9 fix), SL and TP
+          are evaluated against the full wick range of the candle, not just the
+          close price. This prevents false wins (wick to TP then pulls back) and
+          false losses (wick through SL that recovers above entry).
+        - Falls back to ``current_price`` for both high and low when OHLC data
+          is unavailable (WebSocket-only mode).
         - TP1/TP2 are intermediate markers only; the trade stays open until
           TP3 is hit or SL triggers.
         - On close, P&L is applied to the paper balance.
 
         Args:
             symbol: Asset ticker to evaluate.
-            current_price: Latest market price.
+            current_price: Latest market price (used as fallback for high/low).
+            candle_high: Candle high for wick-accurate SL/TP evaluation.
+            candle_low: Candle low for wick-accurate SL/TP evaluation.
 
         Returns:
             A list of ``dict`` representations of trades that were closed
             during this tick (may be empty).
         """
+        # Use wick range if available, else fall back to close price
+        high = candle_high if candle_high is not None else current_price
+        low  = candle_low  if candle_low  is not None else current_price
+
         closed: list[dict] = []
 
         try:
@@ -254,17 +268,27 @@ class PaperTradeEngine:
 
         for row in rows:
             trade = dict(row)
-            result = self._evaluate(trade, current_price)
+            result = self._evaluate(trade, current_price, high=high, low=low)
             if result is not None:
                 closed.append(result)
 
         return closed
 
-    def _evaluate(self, trade: dict, current_price: float) -> Optional[dict]:
+    def _evaluate(self, trade: dict, current_price: float,
+                  high: Optional[float] = None,
+                  low: Optional[float] = None) -> Optional[dict]:
         """Check a single open trade and close/update it if a level is hit.
+
+        Uses ``high``/``low`` (candle wick range) when available for accurate
+        SL and TP evaluation. Falls back to ``current_price`` for both when
+        OHLC data is not provided.
 
         Returns the closed trade dict if the trade was closed, else ``None``.
         """
+        # Resolve evaluation prices — prefer wick range over close
+        eval_high = high if high is not None else current_price
+        eval_low  = low  if low  is not None else current_price
+
         tid        = trade["id"]
         direction  = trade["direction"]
         entry      = trade["entry_price"]
@@ -278,31 +302,31 @@ class PaperTradeEngine:
 
         is_long = (direction == "LONG")
 
-        # --- SL check (highest priority) ---
+        # --- SL check (highest priority — use wick low/high) ---
         sl_triggered = (
-            (is_long  and current_price <= sl) or
-            (not is_long and current_price >= sl)
+            (is_long  and eval_low  <= sl) or
+            (not is_long and eval_high >= sl)
         )
         if sl_triggered:
             return self._close_trade(tid, sl, reason="SL_HIT")
 
-        # --- TP1 marker ---
+        # --- TP1 marker (use wick high/low) ---
         if tp1 is not None and not tp1_hit:
-            if (is_long and current_price >= tp1) or (not is_long and current_price <= tp1):
+            if (is_long and eval_high >= tp1) or (not is_long and eval_low <= tp1):
                 tp1_hit = True
                 self._set_tp_flags(tid, tp1_hit=1)
-                logger.info("[PaperTrade] #%d TP1 hit @ %.4f", tid, current_price)
+                logger.info("[PaperTrade] #%d TP1 hit @ %.4f", tid, eval_high if is_long else eval_low)
 
-        # --- TP2 marker ---
+        # --- TP2 marker (use wick high/low) ---
         if tp2 is not None and not tp2_hit:
-            if (is_long and current_price >= tp2) or (not is_long and current_price <= tp2):
+            if (is_long and eval_high >= tp2) or (not is_long and eval_low <= tp2):
                 tp2_hit = True
                 self._set_tp_flags(tid, tp2_hit=1)
-                logger.info("[PaperTrade] #%d TP2 hit @ %.4f", tid, current_price)
+                logger.info("[PaperTrade] #%d TP2 hit @ %.4f", tid, eval_high if is_long else eval_low)
 
-        # --- TP3 close ---
+        # --- TP3 close (use wick high/low) ---
         if tp3 is not None:
-            if (is_long and current_price >= tp3) or (not is_long and current_price <= tp3):
+            if (is_long and eval_high >= tp3) or (not is_long and eval_low <= tp3):
                 return self._close_trade(tid, tp3, reason="TP3_HIT")
 
         return None

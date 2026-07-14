@@ -455,7 +455,15 @@ async def main():
                     try:
                         if paper_engine is None:
                             break
-                        ticks = paper_engine.tick(asset.symbol, latest_prices.get(asset.symbol, 0))
+                        # M-9: pass candle high/low for wick-accurate SL/TP evaluation
+                        fetcher = asset_fetchers.get(asset.symbol)
+                        candle = fetcher.latest_candle() if fetcher else None
+                        ticks = paper_engine.tick(
+                            asset.symbol,
+                            latest_prices.get(asset.symbol, 0),
+                            candle_high=candle["high"] if candle else None,
+                            candle_low=candle["low"]  if candle else None,
+                        )
                         if ticks:
                             for t in ticks:
                                 reason = t.get("reason", "?")

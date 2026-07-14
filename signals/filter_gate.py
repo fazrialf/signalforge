@@ -22,6 +22,15 @@ from config.settings import (
     DAILY_LOSS_LIMIT_PCT,
     ACCOUNT_BALANCE,
 )
+from config.settings import (
+    MTF_STRENGTH_MIN_SWING,
+    MTF_STRENGTH_MIN_SCALP,
+    SESSION_FILTER_ENABLED,
+    SESSION_ACTIVE_START_UTC,
+    SESSION_ACTIVE_END_UTC,
+    TIER1_ASSETS,
+    PRIMARY_TF,
+)
 try:
     from external.fear_greed import fetch_fear_greed
     from external.economic_calendar import is_near_high_impact_event
@@ -154,6 +163,7 @@ class FilterGate:
             or self._f8_volatility_stub()
             or self._f9_fear_greed_stub()
             or self._f10_spread_stub()
+            or self._f11_session_filter(symbol)
         )
 
         if result is not None:
@@ -204,15 +214,30 @@ class FilterGate:
     def _f3_mtf_aligned(
         self, signal: SignalResult, mtf_bias: MTFBias
     ) -> Optional[FilterResult]:
-        """Filter 3: Multi-timeframe bias must align with the signal direction."""
+        """Filter 3: MTF bias direction must match signal, with sufficient strength.
+
+        Strength thresholds (from settings):
+          - Scalping (5m primary): 0.33 — accepts 1/3 TFs aligned (5m can lead)
+          - Swing (1h+ primary):   0.67 — requires 2/3 TFs aligned
+          - 1.0 (old binary) was too strict — filtered valid swing setups where
+            4H+1H agree but 15m is neutral.
+        """
         expected_direction = "bullish" if signal.signal == "BUY" else "bearish"
-        if not mtf_bias.aligned or mtf_bias.dominant_direction != expected_direction:
+        # Pick threshold based on primary timeframe
+        min_strength = (
+            MTF_STRENGTH_MIN_SCALP if PRIMARY_TF in ("1m", "5m")
+            else MTF_STRENGTH_MIN_SWING
+        )
+        direction_ok = mtf_bias.dominant_direction == expected_direction
+        strength_ok  = mtf_bias.strength >= min_strength
+        if not direction_ok or not strength_ok:
             return FilterResult(
                 passed=False,
                 reason=(
                     f"MTF bias not aligned with {signal.signal}: "
                     f"dominant={mtf_bias.dominant_direction}, "
-                    f"aligned={mtf_bias.aligned} | {mtf_bias.summary}"
+                    f"strength={mtf_bias.strength:.2f} (min={min_strength:.2f}) | "
+                    f"{mtf_bias.summary}"
                 ),
                 filter_name="filter_3_mtf_aligned",
             )
@@ -292,6 +317,35 @@ class FilterGate:
         Always passes until Sprint 7 adds ATR-based volatility classification.
         """
         # TODO Sprint 7: block if ATR spike indicates abnormal volatility regime
+        return None
+
+    def _f11_session_filter(self, symbol: str) -> Optional[FilterResult]:
+        """Filter 11: Block alt-coin signals outside London/NY active session.
+
+        BTC and ETH (TIER1_ASSETS) trade 24/7 — no session restriction.
+        All other assets are blocked outside 07:00–22:00 UTC to avoid the
+        low-liquidity Asian session where spreads are 2–3× wider and false
+        liquidity sweeps are common.
+
+        Window: London open (07:00 UTC) → NY close (22:00 UTC).
+        Configurable via SESSION_ACTIVE_START_UTC / SESSION_ACTIVE_END_UTC.
+        """
+        import datetime
+        if not SESSION_FILTER_ENABLED:
+            return None
+        if symbol in TIER1_ASSETS:
+            return None  # BTC/ETH always allowed
+        hour_utc = datetime.datetime.now(datetime.timezone.utc).hour
+        if not (SESSION_ACTIVE_START_UTC <= hour_utc < SESSION_ACTIVE_END_UTC):
+            return FilterResult(
+                passed=False,
+                reason=(
+                    f"{symbol} outside active session window "
+                    f"({SESSION_ACTIVE_START_UTC:02d}:00–{SESSION_ACTIVE_END_UTC:02d}:00 UTC) "
+                    f"— current hour: {hour_utc:02d}:00 UTC"
+                ),
+                filter_name="filter_11_session",
+            )
         return None
 
     def _f9_fear_greed_stub(self) -> Optional[FilterResult]:

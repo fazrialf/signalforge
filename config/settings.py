@@ -78,6 +78,22 @@ FVG_MIN_SIZE_PCT  = 0.1
 IMPULSE_ATR_MULT  = 1.5
 IMPULSE_VOL_MULT  = 2.0
 
+# --- MTF GATE
+# Minimum alignment strength for filter_3. Swing mode requires 2/3 TFs to agree
+# (0.67); scalping mode accepts 1/3 (0.33) since 5m can lead higher TFs briefly.
+# 1.0 = all 3 TFs aligned (old binary behaviour — too strict for swing setups).
+MTF_STRENGTH_MIN_SWING  = 0.67
+MTF_STRENGTH_MIN_SCALP  = 0.33
+
+# --- SESSION FILTER
+# Alt coins only — BTC/ETH trade 24/7. Alts blocked outside London/NY open.
+# London: 07:00–16:00 UTC. NY: 13:00–22:00 UTC. Overlap: 13:00–16:00 UTC.
+# Combined active window: 07:00–22:00 UTC. TIER1 assets bypass session filter.
+SESSION_FILTER_ENABLED = True
+SESSION_ACTIVE_START_UTC = 7   # 07:00 UTC (London open)
+SESSION_ACTIVE_END_UTC   = 22  # 22:00 UTC (NY close)
+TIER1_ASSETS = ["BTC/USDT", "ETH/USDT"]  # always allowed, no session restriction
+
 # --- HEALTH
 WATCHDOG_INTERVAL   = 300
 WS_STALE_SECONDS    = 120
