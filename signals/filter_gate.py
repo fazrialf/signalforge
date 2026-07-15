@@ -7,9 +7,13 @@ wire in news, volatility, fear/greed, and spread data).
 """
 from __future__ import annotations
 
+import datetime
 import logging
+import sqlite3
 from dataclasses import dataclass
 from typing import Optional
+
+import pandas as pd
 
 from signals.llm_engine import SignalResult
 from signals.mtf_bias import MTFBias
@@ -30,6 +34,10 @@ from config.settings import (
     SESSION_ACTIVE_END_UTC,
     TIER1_ASSETS,
     PRIMARY_TF,
+    ATR_PERIOD,
+    ATR_AVG_PERIOD,
+    ATR_SPIKE_MULTIPLIER,
+    ATR_MIN_BARS,
 )
 try:
     from external.fear_greed import fetch_fear_greed
@@ -102,9 +110,11 @@ class FilterGate:
         self,
         cooldown_tracker: CooldownTracker,
         config: Optional[dict] = None,
+        db_path: Optional[str] = None,
     ) -> None:
         self.cooldown = cooldown_tracker
         self.config: dict = config or {}
+        self._db_path: Optional[str] = db_path
 
         # Thresholds — prefer config dict, fall back to settings
         self.min_confidence: float = self.config.get("min_confidence", MIN_LLM_CONFIDENCE)
@@ -131,6 +141,7 @@ class FilterGate:
         symbol: str,
         active_positions: Optional[list[dict]] = None,
         current_price: float = 0.0,
+        candles: Optional["pd.DataFrame"] = None,
     ) -> FilterResult:
         """Run all 10 filters against *signal* and return the verdict.
 
@@ -142,8 +153,10 @@ class FilterGate:
             active_positions: List of currently open position dicts.  Each
                 dict must contain at least ``{'symbol': str, 'side': str,
                 'risk_pct': float}``.  Defaults to an empty list.
-            current_price: Current market price (used by stub filters;
-                ignored until Sprint 6).
+            current_price: Current market price.
+            candles: Optional DataFrame with columns ``high``, ``low``,
+                ``close`` used by filter 8 (ATR volatility).  When ``None``
+                filter 8 is skipped (fail-safe pass).
 
         Returns:
             :class:`FilterResult` — ``passed=True`` only when every filter
@@ -154,16 +167,16 @@ class FilterGate:
         result = (
             self._f1_confidence(signal)
             or self._f2_rr_ratio(signal)
+            or self._f11_session_filter(symbol)   # M-1: moved up — cheap time check before heavy filters
             or self._f3_mtf_aligned(signal, mtf_bias)
             or self._f4_cooldown(symbol)
             or self._f5_max_active(active_positions)
             or self._f6_portfolio_heat(active_positions)
             or self._f6b_daily_loss_limit(active_positions)
             or self._f7_news_stub()
-            or self._f8_volatility_stub()
+            or self._f8_atr_volatility(candles)
             or self._f9_fear_greed_stub()
             or self._f10_spread_stub()
-            or self._f11_session_filter(symbol)
         )
 
         if result is not None:
@@ -311,12 +324,63 @@ class FilterGate:
             logger.warning("[FilterGate] F7 news check failed: %s — skipping", e)
         return None
 
-    def _f8_volatility_stub(self) -> Optional[FilterResult]:
-        """Filter 8 (stub): Volatility regime check.
+    def _f8_atr_volatility(self, candles: Optional[pd.DataFrame]) -> Optional[FilterResult]:
+        """Filter 8: Block signals during abnormal ATR spike regimes.
 
-        Always passes until Sprint 7 adds ATR-based volatility classification.
+        Logic:
+          - Compute ATR(ATR_PERIOD) using Wilder's smoothed true range.
+          - Compute a rolling mean of ATR over ATR_AVG_PERIOD bars as the baseline.
+          - If the most recent ATR > ATR_SPIKE_MULTIPLIER × baseline → block.
+          - If candles is None or history too short → skip (fail-safe pass).
+
+        This catches flash-crash / news-spike conditions where the spread
+        between TP and SL is meaningless because price is in free-fall or
+        vertical pump — exactly when the LLM is most likely to hallucinate
+        a high-confidence entry.
         """
-        # TODO Sprint 7: block if ATR spike indicates abnormal volatility regime
+        if candles is None or len(candles) < ATR_MIN_BARS:
+            return None  # not enough data — safe to pass
+
+        try:
+            high  = candles["high"].astype(float)
+            low   = candles["low"].astype(float)
+            close = candles["close"].astype(float)
+
+            # True Range: max of three measures
+            prev_close = close.shift(1)
+            tr = pd.concat([
+                high - low,
+                (high - prev_close).abs(),
+                (low  - prev_close).abs(),
+            ], axis=1).max(axis=1)
+
+            # Wilder's smoothed ATR (equivalent to EWM with alpha = 1/period)
+            atr = tr.ewm(alpha=1.0 / ATR_PERIOD, adjust=False).mean()
+
+            # Baseline: rolling mean of ATR over ATR_AVG_PERIOD bars
+            atr_avg = atr.rolling(ATR_AVG_PERIOD).mean()
+
+            current_atr = float(atr.iloc[-1])
+            baseline    = float(atr_avg.iloc[-1])
+
+            if baseline <= 0:
+                return None  # degenerate — skip
+
+            ratio = current_atr / baseline
+            if ratio > ATR_SPIKE_MULTIPLIER:
+                return FilterResult(
+                    passed=False,
+                    reason=(
+                        f"ATR spike detected: current ATR {current_atr:.5f} is "
+                        f"{ratio:.1f}× the {ATR_AVG_PERIOD}-bar average "
+                        f"{baseline:.5f} (threshold {ATR_SPIKE_MULTIPLIER}×) — "
+                        f"abnormal volatility regime, signal unreliable"
+                    ),
+                    filter_name="filter_8_atr_volatility",
+                )
+        except Exception as e:
+            logger.warning("[FilterGate] F8 ATR check failed: %s — skipping", e)
+
         return None
 
     def _f11_session_filter(self, symbol: str) -> Optional[FilterResult]:
@@ -387,15 +451,42 @@ class FilterGate:
     ) -> Optional[FilterResult]:
         """Circuit breaker: block new signals if daily realised loss exceeds limit.
 
-        Reads 'realised_pnl' from each closed position dict for today.
+        Queries the paper_trades table for today's closed trades with negative
+        pnl_usd.  Falls back to scanning active_positions when no db_path was
+        supplied (unit-test / no-DB mode).
+
         Blocks when total loss >= DAILY_LOSS_LIMIT_PCT of ACCOUNT_BALANCE.
         """
         daily_limit_usd = ACCOUNT_BALANCE * (DAILY_LOSS_LIMIT_PCT / 100)
-        today_loss = sum(
-            p.get("realised_pnl", 0.0)
-            for p in active_positions
-            if p.get("realised_pnl", 0.0) < 0
-        )
+
+        if self._db_path:
+            # Query DB for today's realised losses — this is the only reliable
+            # source because active_positions only holds OPEN trades.
+            today_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+            try:
+                with sqlite3.connect(self._db_path, timeout=5) as conn:
+                    rows = conn.execute(
+                        """
+                        SELECT COALESCE(SUM(pnl_usd), 0.0)
+                        FROM   paper_trades
+                        WHERE  status = 'closed'
+                          AND  pnl_usd < 0
+                          AND  DATE(closed_at) = ?
+                        """,
+                        (today_str,),
+                    ).fetchone()
+                today_loss = rows[0] if rows else 0.0
+            except Exception as exc:
+                logger.warning("[FilterGate] daily-loss DB query failed: %s", exc)
+                today_loss = 0.0
+        else:
+            # No DB available — fall back to active_positions (unit-test mode).
+            today_loss = sum(
+                p.get("realised_pnl", 0.0)
+                for p in active_positions
+                if p.get("realised_pnl", 0.0) < 0
+            )
+
         if abs(today_loss) >= daily_limit_usd:
             return FilterResult(
                 passed=False,

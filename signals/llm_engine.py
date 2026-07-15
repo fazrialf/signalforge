@@ -16,13 +16,24 @@ from openai import AsyncOpenAI
 
 from config.settings import (
     OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL, OPENAI_FALLBACK,
-    LLM_TIMEOUT, LLM_MAX_RETRIES, LLM_PROMPT_VERSION,
+    LLM_TIMEOUT, LLM_MAX_RETRIES, LLM_PROMPT_VERSION, LLM_MAX_CONCURRENT,
 )
 
 logger = logging.getLogger(__name__)
 
 # C-4: singleton client — created once, never leaked
 _openai_client: AsyncOpenAI | None = None
+
+# L-1: per-provider concurrency semaphore — prevents 429 bursts when all
+# symbols hit confluence in the same cycle. Provider limit is 3 concurrent;
+# we cap at LLM_MAX_CONCURRENT=2 to leave headroom for retries.
+_llm_semaphore: asyncio.Semaphore | None = None
+
+def _get_semaphore() -> asyncio.Semaphore:
+    global _llm_semaphore
+    if _llm_semaphore is None:
+        _llm_semaphore = asyncio.Semaphore(LLM_MAX_CONCURRENT)
+    return _llm_semaphore
 
 def _get_client() -> AsyncOpenAI:
     global _openai_client
@@ -162,7 +173,7 @@ def _parse_llm_response(raw: str, model: str, latency_ms: int) -> SignalResult:
                     if sig == "BUY":
                         data["rr_ratio"] = (tp1 - entry) / (entry - sl)
                     else:
-                        data["rr_ratio"] = (entry - tp1) / (tp1 - sl) if tp1 != sl else 0.0
+                        data["rr_ratio"] = (entry - tp1) / (entry - sl) if entry != sl else 0.0
                     missing.discard("rr_ratio")
                     logger.info("[LLM] rr_ratio computed from entry/sl/tp1")
             except Exception:
@@ -212,18 +223,34 @@ def _parse_llm_response(raw: str, model: str, latency_ms: int) -> SignalResult:
         return float(val) if val is not None else default
 
     try:
+        entry   = _f(data.get("entry"), 0)
+        sl      = _f(data.get("stop_loss"), 0)
+        tp1     = _f(data.get("tp1"), 0)
+        sig     = str(data.get("signal", "PASS")).upper()
+        llm_rr  = _f(data.get("rr_ratio"), 0)
+
+        # Recompute R:R from price levels whenever LLM returns 0 or omits it.
+        # Trusting LLM-provided rr_ratio is unreliable — recompute always when
+        # prices are available (entry/sl/tp1 all non-zero and entry != sl).
+        if entry and sl and tp1 and entry != sl and llm_rr == 0.0:
+            if sig == "BUY":
+                llm_rr = (tp1 - entry) / (entry - sl)
+            else:
+                llm_rr = (entry - tp1) / (entry - sl)
+            logger.info("[LLM] rr_ratio recomputed from prices (LLM returned 0): %.2f", llm_rr)
+
         return SignalResult(
             signal=signal,
             confidence=_f(data.get("confidence"), 0),
-            entry=_f(data.get("entry"), 0),
-            stop_loss=_f(data.get("stop_loss"), 0),
-            tp1=_f(data.get("tp1"), 0),
+            entry=entry,
+            stop_loss=sl,
+            tp1=tp1,
             tp2=_f(data.get("tp2"), 0),
             tp3=_f(data.get("tp3"), 0),
             reasoning=str(data.get("reasoning") or ""),
             key_risk=str(data.get("key_risk") or ""),
             timeframe=str(data.get("timeframe") or "1h"),
-            rr_ratio=_f(data.get("rr_ratio"), 0),
+            rr_ratio=llm_rr,
             model_used=model,
             prompt_version=LLM_PROMPT_VERSION,
             latency_ms=latency_ms,
@@ -264,6 +291,9 @@ async def call_llm(
 
     Tries OPENAI_MODEL first, falls back to OPENAI_FALLBACK.
     Returns a SignalResult — never raises.
+
+    L-1: Acquires the per-provider semaphore before each API call to prevent
+    concurrent-limit 429 errors when all symbols hit confluence simultaneously.
     """
     model = model or OPENAI_MODEL
     client = _get_client()  # C-4: reuse singleton, no leak
@@ -275,15 +305,17 @@ async def call_llm(
         t0 = time.monotonic()
         try:
             logger.info(f"[LLM] Calling {current_model} (attempt {attempt + 1})...")
-            response = await client.chat.completions.create(
-                model=current_model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=temperature,
-                max_tokens=2048,
-            )
+            # L-1: semaphore limits simultaneous API calls to LLM_MAX_CONCURRENT
+            async with _get_semaphore():
+                response = await client.chat.completions.create(
+                    model=current_model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=temperature,
+                    max_tokens=4096,
+                )
             latency_ms = int((time.monotonic() - t0) * 1000)
             raw = response.choices[0].message.content or ""
             logger.info(f"[LLM] Response in {latency_ms}ms from {current_model}")
