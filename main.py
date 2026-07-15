@@ -44,7 +44,16 @@ from trading.paper_trade import PaperTradeEngine
 from config.assets import PAPER_MODE, get_enabled_assets
 from monitoring.error_alerter import ErrorAlerter
 from monitoring.health_endpoint import HealthServer
-from config.settings import MIN_CONFLUENCE_SCORE, MIN_LLM_CONFIDENCE, MIN_RR_RATIO, ACCOUNT_BALANCE, COOLDOWN_MINUTES, SWING_LOOKBACK, DB_PATH, LOG_PATH, BASE_DIR
+from core.session_marker import (
+    get_current_session, get_session_opens_in_window,
+    format_session_label, format_session_open_alert,
+)
+from config.settings import (
+    MIN_CONFLUENCE_SCORE, MIN_LLM_CONFIDENCE, MIN_RR_RATIO,
+    ACCOUNT_BALANCE, COOLDOWN_MINUTES, SWING_LOOKBACK,
+    DB_PATH, LOG_PATH, BASE_DIR,
+    MAX_CONCURRENT, MAX_PORTFOLIO_HEAT_PCT,
+)
 try:
     from external.news_fetcher import fetch_recent_news, is_high_impact_news
     from external.fear_greed import fetch_fear_greed
@@ -116,6 +125,16 @@ async def main():
                         a.symbol, tf, len(df),
                         df["close"].iloc[-1] if not df.empty else 0)
 
+    # Q-6: startup assertion — every configured asset must have a fetcher.
+    # A missing key causes a silent None later (line ~479: fetcher.latest_candle()
+    # on None crashes mid-session). Better to fail loud at boot.
+    missing = [a.symbol for a in enabled_assets if a.symbol not in asset_fetchers]
+    if missing:
+        msg = f"[STARTUP] asset_fetchers missing keys: {missing} — check assets config"
+        logger.critical(msg)
+        await bot.send(f"❌ <b>Startup aborted</b>\n{msg}")
+        raise RuntimeError(msg)
+
     summary_lines = [f"\U0001f4ca <b>Historical data loaded for {len(enabled_symbols)} assets!</b>"]
     for sym in enabled_symbols:
         p = latest_prices.get(sym, 0.0)
@@ -181,39 +200,53 @@ async def main():
     # M-5: per-symbol broadcast timer (was a single shared value — starved non-BTC assets)
     last_structure_broadcast: dict[str, float] = {}
 
+    # Session marker — tracks last check time for one-shot session open alerts
+    import datetime as _dt
+    last_session_check: _dt.datetime = _dt.datetime.now(_dt.timezone.utc)
+
     # S-3: BOS retest watcher — per-symbol state machine, lives for the session
     bos_watcher = BOSRetestWatcher()
 
     async def run_smc_pipeline():
-        nonlocal last_structure_broadcast, latest_prices, active_positions
+        nonlocal last_structure_broadcast, latest_prices, active_positions, last_session_check
         while True:
             try:
+                # --- Session open alerts ---
+                now_utc = _dt.datetime.now(_dt.timezone.utc)
+                opened_sessions = get_session_opens_in_window(last_session_check, now_utc)
+                for sess in opened_sessions:
+                    logger.info("[SESSION] %s open", sess.name)
+                    await bot.send(format_session_open_alert(sess, now_utc))
+                last_session_check = now_utc
+
                 # Iterate over every enabled asset
                 for asset_idx, a in enumerate(enabled_assets):
                     symbol = a.symbol
                     primary_tf = a.primary_tf
                     logger.info("Analyzing %s...", symbol)
 
-                    # Reload fresh OHLCV from DB for this symbol
+                    # Reload fresh OHLCV from DB for this symbol — one
+                    # connection per symbol, closed when the with-block exits.
                     fresh_data = {}
-                    for tf in a.timeframes:
-                        rows = conn.execute(
-                            f"SELECT ts, open, high, low, close, volume "
-                            f"FROM candles WHERE timeframe = ? AND symbol = ? "
-                            f"ORDER BY ts ASC", (tf, symbol)
-                        ).fetchall()
-                        if rows:
-                            df_fresh = pd.DataFrame(
-                                rows, columns=["ts", "open", "high", "low", "close", "volume"]
-                            )
-                            df_fresh["timestamp"] = pd.to_datetime(df_fresh["ts"], unit="ms")
-                            df_fresh = df_fresh.set_index("timestamp")
-                            df_fresh.drop(columns=["ts"], inplace=True)
-                            fresh_data[tf] = df_fresh
-                        else:
-                            # Fallback to cached data from startup fetcher
-                            cached = asset_fetchers.get(symbol)
-                            fresh_data[tf] = cached.get(tf) if cached else pd.DataFrame()
+                    with sqlite3.connect(DB_PATH, timeout=10) as _conn:
+                        for tf in a.timeframes:
+                            rows = _conn.execute(
+                                "SELECT ts, open, high, low, close, volume "
+                                "FROM candles WHERE timeframe = ? AND symbol = ? "
+                                "ORDER BY ts ASC", (tf, symbol)
+                            ).fetchall()
+                            if rows:
+                                df_fresh = pd.DataFrame(
+                                    rows, columns=["ts", "open", "high", "low", "close", "volume"]
+                                )
+                                df_fresh["timestamp"] = pd.to_datetime(df_fresh["ts"], unit="ms")
+                                df_fresh = df_fresh.set_index("timestamp")
+                                df_fresh.drop(columns=["ts"], inplace=True)
+                                fresh_data[tf] = df_fresh
+                            else:
+                                # Fallback to cached data from startup fetcher
+                                cached = asset_fetchers.get(symbol)
+                                fresh_data[tf] = cached.get(tf) if cached else pd.DataFrame()
 
                     price = latest_prices.get(symbol, 0.0)
                     results = analyse_all_timeframes(fresh_data, current_price=price)
@@ -232,10 +265,12 @@ async def main():
                         last_structure_broadcast[symbol] = now
                         tf_4h = results.get("4h")
                         tf_1h = results.get("1h")
+                        current_session = get_current_session()
                         msg_parts = [
                             "🏗️ <b>Structure Snapshot</b>",
                             f"Asset: <b>{symbol}</b>",
                             f"Price: <b>${price:,.2f}</b>",
+                            f"Session: {format_session_label(current_session)}",
                         ]
                         for label, r in [("4H", tf_4h), ("1H", tf_1h)]:
                             if r and r.structure:
@@ -478,9 +513,13 @@ async def main():
                         # M-9: pass candle high/low for wick-accurate SL/TP evaluation
                         fetcher = asset_fetchers.get(asset.symbol)
                         candle = fetcher.latest_candle() if fetcher else None
+                        _tick_price = latest_prices.get(asset.symbol, 0)
+                        if _tick_price == 0:
+                            logger.debug("[PAPER] %s skipping tick — price is 0", asset.symbol)
+                            continue
                         ticks = paper_engine.tick(
                             asset.symbol,
-                            latest_prices.get(asset.symbol, 0),
+                            _tick_price,
                             candle_high=candle["high"] if candle else None,
                             candle_low=candle["low"]  if candle else None,
                         )
@@ -514,14 +553,44 @@ async def main():
     )
     filter_gate = FilterGate(
         cooldown_tracker=cooldown_tracker,
+        db_path=str(DB_PATH),
         config={
             'min_confidence': MIN_LLM_CONFIDENCE,
             'min_rr': MIN_RR_RATIO,
-            'max_active_signals': 3,
-            'max_heat': 6.0,
+            'max_active_signals': MAX_CONCURRENT,
+            'max_heat': MAX_PORTFOLIO_HEAT_PCT,
         },
     )
     active_positions: list[dict] = []   # C-5: pruned on each cycle — entries removed when paper engine closes them
+
+    # M-3: Restore open positions from DB on startup so FilterGate heat/concurrent
+    # checks are accurate immediately after a restart, not just after the first close.
+    if PAPER_MODE:
+        try:
+            with sqlite3.connect(DB_PATH, timeout=5) as _rc:
+                _rc.row_factory = sqlite3.Row
+                _open_rows = _rc.execute(
+                    "SELECT symbol, direction, entry_price, sl, position_size "
+                    "FROM paper_trades WHERE status = 'OPEN'"
+                ).fetchall()
+            for _row in _open_rows:
+                _sl_dist = abs(_row["entry_price"] - _row["sl"])
+                _risk_usd = _sl_dist * (_row["position_size"] or 0.0)
+                active_positions.append({
+                    "symbol":    _row["symbol"],
+                    "side":      _row["direction"],
+                    "entry":     _row["entry_price"],
+                    "stop_loss": _row["sl"],
+                    "risk_usd":  _risk_usd,
+                })
+            if _open_rows:
+                logger.info(
+                    "[M-3] Restored %d open paper position(s) from DB: %s",
+                    len(_open_rows),
+                    [r["symbol"] for r in _open_rows],
+                )
+        except Exception as _e:
+            logger.warning("[M-3] Could not restore active_positions from DB: %s", _e)
 
     # --- Position Tracker + Command Handler ---
     position_tracker = PositionTracker(db_path=str(DB_PATH))
@@ -534,7 +603,7 @@ async def main():
     # --- Paper Trading Engine ---
     # Q-5: only instantiate when PAPER_MODE is enabled — avoids DB schema init in live mode
     if PAPER_MODE:
-        paper_engine = PaperTradeEngine(db_path=str(DB_PATH), initial_balance=10000.0)
+        paper_engine = PaperTradeEngine(db_path=str(DB_PATH), initial_balance=ACCOUNT_BALANCE)
         logger.info("PAPER MODE enabled — signals simulated, no real orders")
     else:
         paper_engine = None
@@ -551,7 +620,7 @@ async def main():
     # Start health server and error monitoring
     health_task = asyncio.create_task(health_server.start())
     monitor_task = asyncio.create_task(alerter.start_monitoring())
-    health_server.set_health('database', 'healthy', 'SQLite connected')
+    health_server.set_health('database', 'ok', 'SQLite connected')
     # Register WebSocket health (BTC price already available)
     for sym in enabled_symbols:
         is_alive = latest_prices.get(sym, 0.0) > 0
@@ -563,7 +632,6 @@ async def main():
         health_server.set_health("websocket", "degraded", "no BTC tick yet")
     logger.info("Error alerter + health endpoint started (port 8080)")
 
-    conn = sqlite3.connect(DB_PATH)
     smc_task = asyncio.create_task(run_smc_pipeline())
 
     await bot.send("🟢 <b>SignalForge is online</b>\n\nSMC analysis running every 60s.")
