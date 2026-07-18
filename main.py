@@ -67,6 +67,7 @@ try:
     from external.news_fetcher import fetch_recent_news, is_high_impact_news, get_news_sentiment
     from external.fear_greed import fetch_fear_greed
     from external.onchain import fetch_onchain_metrics
+    from external.liquidation_tracker import fetch_liquidation_levels
     from external.correlations import fetch_correlations
     _EXTERNAL_AVAILABLE = True
 except ImportError:
@@ -128,7 +129,7 @@ async def main():
     asset_fetchers: dict[str, DataFetcher] = {}
     latest_prices: dict[str, float] = {}
     for a in enabled_assets:
-        fetcher = DataFetcher(a.symbol, a.timeframes, a.lookback_bars)
+        fetcher = DataFetcher(a.symbol, a.timeframes, a.lookback_bars, use_futures=a.use_futures)
         data = await fetcher.load_all()
         asset_fetchers[a.symbol] = fetcher
         latest_prices[a.symbol] = fetcher.latest_price() or 0.0
@@ -634,6 +635,18 @@ async def main():
                                 except Exception as e:
                                     logger.warning("[EXT] On-chain fetch failed: %s", e)
                                 try:
+                                    liq_data = fetch_liquidation_levels(symbol, price)
+                                    external_data['liquidation'] = liq_data
+                                    logger.info(
+                                        "[EXT] %s liq clusters=%d dense=%s sweep=%s",
+                                        symbol,
+                                        len(liq_data.get('clusters', [])),
+                                        liq_data.get('dense_cluster_nearby', False),
+                                        liq_data.get('sweep_direction'),
+                                    )
+                                except Exception as e:
+                                    logger.warning("[EXT] Liquidation fetch failed for %s: %s", symbol, e)
+                                try:
                                     external_data['correlations'] = await asyncio.to_thread(fetch_correlations)
                                 except Exception as e:
                                     logger.warning("[EXT] Correlations fetch failed: %s", e)
@@ -668,6 +681,7 @@ async def main():
                                     primary_r, mtf_aligned=mtf_bias.aligned,
                                     threshold=MIN_CONFLUENCE_SCORE, mtf_bias=mtf_bias,
                                     onchain=onchain_data, news_sentiment=news_sent,
+                                    liquidation=external_data.get('liquidation'),
                                 )
                                 logger.info(
                                     "[CONFLUENCE+EXT] %s enriched: net=%d bull=%d bear=%d funding=%s oi_chg=%.1f%% news=%s",
@@ -774,6 +788,7 @@ async def main():
                                         "primary_risk":    signal.key_risk,
                                         "onchain":         external_data.get('onchain', {}),
                                         "news_sentiment":  external_data.get('news_sentiment', 'neutral'),
+                                        "liquidation":     external_data.get('liquidation', {}),
                                     }
                                     await bot.send_signal(signal_dict)
                                     # Also send position sizing as follow-up line

@@ -143,6 +143,7 @@ def score_confluence(
     mtf_bias: Optional[MTFBias] = None,
     onchain: dict | None = None,
     news_sentiment: str | None = None,
+    liquidation: dict | None = None,
 ) -> ConfluenceScore:
     """Evaluate confluence factors from an :class:`SMCAnalysisResult`.
 
@@ -377,6 +378,42 @@ def score_confluence(
             _add(factors, "news_bullish", 3, "bullish", "Recent high-impact news is bullish for crypto")
         elif news_sentiment == "bearish":
             _add(factors, "news_bearish", 3, "bearish", "Recent high-impact news is bearish — caution on longs")
+
+    # --- Tier 2: Liquidation Sweep Target ------------------------------------
+    # Price approaching a dense liquidation cluster = high-probability sweep.
+    # Uses pre-computed data from external.liquidation_tracker.
+    if liquidation:
+        sweep_dir = liquidation.get("sweep_direction")
+        dense = liquidation.get("dense_cluster_nearby", False)
+        clusters = liquidation.get("clusters", [])
+        if dense and sweep_dir == "bullish":
+            nearby = min((c for c in clusters if abs(c.get("distance_pct", 99)) <= 1.5),
+                         key=lambda c: abs(c["distance_pct"]), default=None)
+            desc = (f"Dense short-liq cluster at ${nearby['price']:,.4f} "
+                    f"({nearby['distance_pct']:+.1f}%) — bullish sweep target"
+                    if nearby else "Dense short-liq cluster nearby — bullish sweep target")
+            _add(factors, "liq_sweep_bullish", 2, "bullish", desc)
+        elif dense and sweep_dir == "bearish":
+            nearby = min((c for c in clusters if abs(c.get("distance_pct", 99)) <= 1.5),
+                         key=lambda c: abs(c["distance_pct"]), default=None)
+            desc = (f"Dense long-liq cluster at ${nearby['price']:,.4f} "
+                    f"({nearby['distance_pct']:+.1f}%) — bearish sweep target"
+                    if nearby else "Dense long-liq cluster nearby — bearish sweep target")
+            _add(factors, "liq_sweep_bearish", 2, "bearish", desc)
+        elif clusters:
+            # Weaker: any significant cluster within 2% in trade direction
+            bull_targets = [c for c in clusters if c.get("side") == "short"
+                            and 0 < c.get("distance_pct", -99) <= 2.0]
+            bear_targets = [c for c in clusters if c.get("side") == "long"
+                            and -2.0 <= c.get("distance_pct", 99) < 0]
+            if bull_targets:
+                best = max(bull_targets, key=lambda c: c.get("total_qty", 0))
+                _add(factors, "liq_pool_above", 2, "bullish",
+                     f"Short-liq pool at ${best['price']:,.4f} ({best['distance_pct']:+.1f}%) — upside magnet")
+            if bear_targets:
+                best = max(bear_targets, key=lambda c: c.get("total_qty", 0))
+                _add(factors, "liq_pool_below", 2, "bearish",
+                     f"Long-liq pool at ${best['price']:,.4f} ({best['distance_pct']:+.1f}%) — downside magnet")
 
     # ==================================================================
     # Aggregate

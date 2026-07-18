@@ -230,6 +230,19 @@ class TelegramBot:
         fr_icon = "\U0001f7e2" if fr > 0.0001 else ("\U0001f534" if fr < -0.0001 else "\u26aa")
         oi_icon = "\u2191" if oi_chg > 1 else ("\u2193" if oi_chg < -1 else "\u2194")
 
+        # Liquidation summary
+        liq = d.get("liquidation", {})
+        liq_dense = liq.get("dense_cluster_nearby", False)
+        liq_sweep = liq.get("sweep_direction")
+        liq_clusters = liq.get("clusters", [])
+        if liq_dense and liq_sweep:
+            liq_summary = f"{liq_sweep.capitalize()} sweep target (\U0001f525)"
+        elif liq_clusters:
+            nearest = min(liq_clusters, key=lambda c: abs(c.get("distance_pct", 99)))
+            liq_summary = f"Pool at ${nearest['price']:,.4f} ({nearest['distance_pct']:+.1f}%)"
+        else:
+            liq_summary = "No clusters nearby"
+
         # Confluence factors summary (top 5)
         detail = d.get("confluence_detail", {})
         factor_lines = ""
@@ -258,6 +271,7 @@ class TelegramBot:
             f"  {fr_icon} Funding: <code>{fr:+.4%}</code>   {oi_icon} OI: <code>{oi_chg:+.1f}%</code>\n"
             f"  \U0001f465 L/S: <code>{ls_ratio:.2f}</code>   \U0001f3b2 Taker Buy: <code>{taker_ratio:.0%}</code>\n"
             f"  {news_icon} News: <b>{news_sent.capitalize()}</b>\n"
+            f"  \U0001f4a5 Liq: <b>{liq_summary}</b>\n"
             f"\n"
             f"\U0001f9e0 <b>Confluence {score} \u2014 {badge}</b>\n"
             f"{factor_lines}\n"

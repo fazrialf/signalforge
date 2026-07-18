@@ -49,6 +49,9 @@ class AssetConfig:
     """Set False to exclude the asset from all pipelines without removing
     it from the list."""
 
+    use_futures: bool = False
+    """Set True for Futures-only assets (e.g. HYPE/USDT:USDT on binanceusdm)."""
+
     # ------------------------------------------------------------------ #
     # Signal quality thresholds (override global settings.py defaults)    #
     # ------------------------------------------------------------------ #
@@ -162,6 +165,31 @@ ASSETS: list[AssetConfig] = [
         lookback_bars=300,
         cooldown_minutes=10,
         description="TRON (scalping)",
+    ),
+    AssetConfig(
+        symbol="HYPE/USDT:USDT",
+        binance_symbol="HYPEUSDT",
+        timeframes=["1m", "5m", "15m", "1h"],
+        primary_tf="5m",
+        lookback_bars=300,
+        cooldown_minutes=10,
+        min_confluence_score=5,
+        min_rr=1.8,
+        description="Hyperliquid (scalping)",
+        enabled=True,
+        use_futures=True,
+    ),
+    AssetConfig(
+        symbol="SUI/USDT",
+        binance_symbol="SUIUSDT",
+        timeframes=["1m", "5m", "15m", "1h"],
+        primary_tf="5m",
+        lookback_bars=300,
+        cooldown_minutes=10,
+        min_confluence_score=5,
+        min_rr=1.8,
+        description="Sui (scalping)",
+        enabled=True,
     ),
 ]
 

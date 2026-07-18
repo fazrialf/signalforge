@@ -26,11 +26,14 @@ LOOKBACK_1M_BARS = 120
 
 class DataFetcher:
     def __init__(self, symbol: str, timeframes: list[str],
-                 history_bars: int = 300):
+                 history_bars: int = 300, use_futures: bool = False):
         self.symbol      = symbol
         self.timeframes  = timeframes
         self.history_bars = history_bars
-        self.exchange    = ccxt.binance({"enableRateLimit": True})
+        if use_futures:
+            self.exchange = ccxt.binanceusdm({"enableRateLimit": True})
+        else:
+            self.exchange = ccxt.binance({"enableRateLimit": True})
         # In-memory cache: {tf: pd.DataFrame}
         self._cache: dict[str, pd.DataFrame] = {}
 
