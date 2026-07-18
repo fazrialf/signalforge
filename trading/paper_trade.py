@@ -492,8 +492,11 @@ class PaperTradeEngine:
                         (cutoff_ms,),
                     ).fetchall()
                 else:
+                    # days=0 means all-time — cap at 1000 rows to prevent
+                    # unbounded full-table scan after months of operation.
                     rows = conn.execute(
-                        "SELECT * FROM paper_trades WHERE status != 'OPEN' ORDER BY closed_at DESC"
+                        "SELECT * FROM paper_trades WHERE status != 'OPEN' "
+                        "ORDER BY closed_at DESC LIMIT 1000"
                     ).fetchall()
             return [dict(r) for r in rows]
         except sqlite3.Error as exc:

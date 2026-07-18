@@ -53,6 +53,7 @@ def get_filter_stats(db_path: str, days: int = 7) -> dict:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
+        try:
         
         # Total signals evaluated in period
         total = cursor.execute(

@@ -407,3 +407,236 @@ def calc_premium_discount(swing_high: float,
         current_price=round(current_price, 2),
         zone=zone
     )
+
+
+# ================================================================
+# EQUAL HIGHS / EQUAL LOWS (Liquidity Sweep Target Detection)
+# ================================================================
+
+@dataclass
+class EqualLevel:
+    """A cluster of swing points at nearly the same price — resting liquidity.
+
+    Attributes:
+        price: Average price of the cluster.
+        type: 'equal_highs' or 'equal_lows'.
+        touches: Number of swing points forming this level.
+        first_bar: Bar index of the first touch.
+        last_bar: Bar index of the most recent touch.
+        swept: Whether price has already broken beyond this level.
+        sweep_bar: Bar index where the sweep occurred (None if not swept).
+        reclaimed: Whether price closed back inside after sweep.
+    """
+    price: float
+    type: str           # 'equal_highs' or 'equal_lows'
+    touches: int
+    first_bar: int
+    last_bar: int
+    swept: bool = False
+    sweep_bar: Optional[int] = None
+    reclaimed: bool = False
+
+
+def detect_equal_levels(
+    df: pd.DataFrame,
+    swings: list,
+    tolerance_pct: float = 0.001,
+    min_touches: int = 3,
+    lookback_bars: int = 100,
+) -> list[EqualLevel]:
+    """Detect equal highs and equal lows from swing points.
+
+    Equal highs/lows are clusters of swing points at nearly the same price,
+    indicating resting liquidity (buy stops above equal highs, sell stops
+    below equal lows). These are prime sweep targets for institutional
+    order flow.
+
+    Args:
+        df: OHLCV DataFrame.
+        swings: List of SwingPoint objects from detect_swing_points().
+        tolerance_pct: Max % difference between swing prices to be considered
+            'equal'. Default 0.1% — tight enough for scalping.
+        min_touches: Minimum number of swings at the same level to qualify.
+            Default 3 (classic ICT equal highs/lows).
+        lookback_bars: Only consider swings within this many bars from end.
+
+    Returns:
+        List of EqualLevel objects, sorted by proximity to current price.
+    """
+    if not swings or df is None or len(df) < 10:
+        return []
+
+    current_price = float(df["close"].iloc[-1])
+    last_bar_idx = len(df) - 1
+    cutoff_bar = max(0, last_bar_idx - lookback_bars)
+
+    # Separate highs and lows within lookback window.
+    # SwingPoint uses `.index` (not bar_index) — fall back to bar_index for
+    # any alternate swing types that may expose that attribute.
+    def _swing_bar(s) -> int:
+        return int(getattr(s, "index", getattr(s, "bar_index", 0)) or 0)
+
+    recent_highs = [
+        s for s in swings
+        if s.type == "high" and _swing_bar(s) >= cutoff_bar
+    ]
+    recent_lows = [
+        s for s in swings
+        if s.type == "low" and _swing_bar(s) >= cutoff_bar
+    ]
+
+    results: list[EqualLevel] = []
+
+    # Cluster swing highs
+    _cluster_swings(recent_highs, "equal_highs", tolerance_pct, min_touches,
+                    df, current_price, results)
+
+    # Cluster swing lows
+    _cluster_swings(recent_lows, "equal_lows", tolerance_pct, min_touches,
+                    df, current_price, results)
+
+    # Sort by distance to current price (closest first)
+    results.sort(key=lambda lvl: abs(lvl.price - current_price))
+
+    return results
+
+
+def _cluster_swings(
+    swings: list,
+    level_type: str,
+    tolerance_pct: float,
+    min_touches: int,
+    df: pd.DataFrame,
+    current_price: float,
+    results: list[EqualLevel],
+) -> None:
+    """Group swing points into price clusters and detect equal levels."""
+    if len(swings) < min_touches:
+        return
+
+    # Sort by price for clustering
+    sorted_swings = sorted(swings, key=lambda s: s.price)
+    used = set()
+
+    for i, anchor in enumerate(sorted_swings):
+        if i in used:
+            continue
+
+        cluster = [anchor]
+        used.add(i)
+
+        # Find all swings within tolerance of this anchor
+        for j in range(i + 1, len(sorted_swings)):
+            if j in used:
+                continue
+            candidate = sorted_swings[j]
+            pct_diff = abs(candidate.price - anchor.price) / anchor.price
+            if pct_diff <= tolerance_pct:
+                cluster.append(candidate)
+                used.add(j)
+            else:
+                break  # sorted, so all subsequent are further away
+
+        if len(cluster) >= min_touches:
+            avg_price = sum(s.price for s in cluster) / len(cluster)
+            # Prefer SwingPoint.index; fall back to bar_index / 0
+            bar_indices = [
+                int(getattr(s, "index", getattr(s, "bar_index", 0)) or 0)
+                for s in cluster
+            ]
+            first_bar = min(bar_indices)
+            last_bar = max(bar_indices)
+
+            # Check if level has been swept (price went beyond it)
+            swept, sweep_bar, reclaimed = _check_sweep(
+                df, avg_price, level_type, last_bar
+            )
+
+            results.append(EqualLevel(
+                price=round(avg_price, 6),
+                type=level_type,
+                touches=len(cluster),
+                first_bar=first_bar,
+                last_bar=last_bar,
+                swept=swept,
+                sweep_bar=sweep_bar,
+                reclaimed=reclaimed,
+            ))
+
+
+def _check_sweep(
+    df: pd.DataFrame,
+    level_price: float,
+    level_type: str,
+    formed_bar: int,
+) -> tuple[bool, Optional[int], bool]:
+    """Check if an equal level has been swept and/or reclaimed.
+
+    Args:
+        df: OHLCV DataFrame.
+        level_price: The equal level price.
+        level_type: 'equal_highs' or 'equal_lows'.
+        formed_bar: Bar index when the level was fully formed (last touch).
+
+    Returns:
+        (swept, sweep_bar, reclaimed)
+    """
+    if formed_bar >= len(df) - 1:
+        return False, None, False
+
+    # Check bars after formation
+    post_bars = df.iloc[formed_bar + 1:]
+    if post_bars.empty:
+        return False, None, False
+
+    high = post_bars["high"].astype(float).values
+    low = post_bars["low"].astype(float).values
+    close = post_bars["close"].astype(float).values
+
+    swept = False
+    sweep_bar = None
+    reclaimed = False
+
+    if level_type == "equal_highs":
+        # Sweep = price went above the level (took buy stops)
+        for idx in range(len(high)):
+            if high[idx] > level_price:
+                swept = True
+                sweep_bar = formed_bar + 1 + idx
+                # Reclaim = price closed back below after sweep
+                if idx < len(close) - 1:
+                    # Check if any subsequent close is below the level
+                    subsequent_closes = close[idx + 1:]
+                    if len(subsequent_closes) > 0 and subsequent_closes[-1] < level_price:
+                        reclaimed = True
+                break
+
+    elif level_type == "equal_lows":
+        # Sweep = price went below the level (took sell stops)
+        for idx in range(len(low)):
+            if low[idx] < level_price:
+                swept = True
+                sweep_bar = formed_bar + 1 + idx
+                # Reclaim = price closed back above after sweep
+                if idx < len(close) - 1:
+                    subsequent_closes = close[idx + 1:]
+                    if len(subsequent_closes) > 0 and subsequent_closes[-1] > level_price:
+                        reclaimed = True
+                break
+
+    return swept, sweep_bar, reclaimed
+
+
+def get_unsweep_levels(
+    equal_levels: list[EqualLevel],
+) -> list[EqualLevel]:
+    """Return only unswept equal levels — active liquidity targets."""
+    return [lvl for lvl in equal_levels if not lvl.swept]
+
+
+def get_swept_reclaimed_levels(
+    equal_levels: list[EqualLevel],
+) -> list[EqualLevel]:
+    """Return levels that were swept AND reclaimed — entry signals."""
+    return [lvl for lvl in equal_levels if lvl.swept and lvl.reclaimed]
+

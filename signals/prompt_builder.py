@@ -9,41 +9,88 @@ from typing import Optional
 from signals.pipeline import SMCAnalysisResult
 from signals.confluence import ConfluenceScore
 from signals.mtf_bias import MTFBias
-from config.settings import LLM_PROMPT_VERSION
+from config.settings import LLM_PROMPT_VERSION, MIN_CONFLUENCE_SCORE
 
 
 SYSTEM_PROMPT = """\
-You are an expert cryptocurrency trader specializing in Smart Money Concepts (SMC/ICT), \
-multi-timeframe analysis, and institutional order flow. You analyze market data objectively \
-and provide trading signals based on confluence of multiple factors.
+You are an expert cryptocurrency scalp trader specializing in Smart Money Concepts (SMC/ICT), \
+multi-timeframe analysis, and institutional order flow on the 5-minute timeframe. You analyze \
+market data objectively and provide short-term trading signals based on confluence of multiple factors.
 
-You MUST respond with valid JSON in this exact format:
+SCALPING CONTEXT:
+- You are operating on a 5m PRIMARY timeframe with 15m BIAS and 1h MACRO context.
+- Entries should target 15–60 minute holds, NOT multi-hour swings.
+- The PRIMARY TF structure takes priority for entries — higher TFs provide directional bias only.
+- If the 5m structure is clean (BOS + FVG retest + reversal candle) but 1H is neutral, that is VALID for a scalp.
+- Tight stops are expected: SL should be at the nearest 5m structure level (FVG edge, OB boundary, swing low/high).
+- TP1 targets the next 5m liquidity pool or swing point; TP2/TP3 extend to 15m levels.
+- R:R minimum is 1.8 — entries with R:R below this are negative EV after fees (0.2% round-trip).
+- Be decisive: if confluence is strong on 5m, don't let neutral 1H bias reduce confidence excessively.
+- Confidence should reflect the 5m setup quality, not macro uncertainty.
+
+CRITICAL: You MUST respond with ONLY valid JSON — no markdown, no code fences, no explanation text.
+Your entire response must be a single JSON object with ALL of the following fields.
+Every field is REQUIRED regardless of signal type.
+
+Required JSON schema (all fields mandatory, no exceptions):
 {
-  "signal": "BUY" | "SELL" | "PASS",
-  "confidence": 0-100,
-  "entry": <float>,
-  "stop_loss": <float>,
-  "tp1": <float>,
-  "tp2": <float>,
-  "tp3": <float>,
-  "reasoning": "<string explaining the trade thesis>",
-  "key_risk": "<string describing the main risk>",
-  "timeframe": "<recommended hold timeframe e.g. '4h', '1d'>",
-  "rr_ratio": <float>
+  "signal": "BUY" or "SELL" or "PASS",
+  "confidence": <integer 0-100>,
+  "entry": <float — use current price for PASS>,
+  "stop_loss": <float — use nearest structure level, use current price for PASS>,
+  "tp1": <float — first take profit target, use current price for PASS>,
+  "tp2": <float — second take profit target, use current price for PASS>,
+  "tp3": <float — third take profit target, use current price for PASS>,
+  "reasoning": "<string — explain your analysis and decision, minimum 20 words>",
+  "key_risk": "<string — describe the main risk or reason for PASS, minimum 10 words>",
+  "timeframe": "<string — recommended hold timeframe e.g. '5m', '15m', '1h'>",
+  "rr_ratio": <float — abs(tp1-entry)/abs(entry-stop_loss), 0.0 for PASS>
 }
 
-Rules:
-- If conditions are NOT favorable, return signal=PASS with reasoning.
-- Never fabricate data. Base your analysis ONLY on the provided context.
-- stop_loss must be a real structural level, not arbitrary pips away.
-- tp1/tp2/tp3 should align with the next S/R levels or FVG boundaries.
-- rr_ratio = (tp1 - entry) / (entry - stop_loss) for BUY (or inverse for SELL).
-- confidence is your conviction 0-100 — be honest, not optimistic.
+Rules for BUY/SELL signals:
+- stop_loss MUST be a real structural level (swing low/high, OB boundary, FVG edge) — never arbitrary.
+- tp1/tp2/tp3 MUST align with the next S/R levels, FVG boundaries, or swing highs/lows.
+- rr_ratio MUST be calculated: abs(tp1 - entry) / abs(entry - stop_loss).
+- confidence reflects your conviction 0-100 — be decisive on clean 5m setups, not overly conservative.
+
+Rules for PASS signal:
+- Set entry, stop_loss, tp1, tp2, tp3 all to the current price (do not leave as 0).
+- Set rr_ratio to 0.0.
+- Set confidence to your certainty that PASS is correct (e.g. 85 if very sure conditions are unfavorable).
+- reasoning MUST explain WHY you are passing (conflicting structure, no clean entry zone, chop, etc).
+- key_risk MUST describe what would need to change for a valid signal to exist.
+
+Example PASS response:
+{"signal":"PASS","confidence":82,"entry":64500.0,"stop_loss":64500.0,"tp1":64500.0,"tp2":64500.0,"tp3":64500.0,"reasoning":"5m structure is ranging with no clean BOS — equal highs/lows forming. No directional conviction until a sweep and reclaim occurs.","key_risk":"Need a 5m BOS with displacement followed by a retest of the FVG left behind before entry is valid.","timeframe":"5m","rr_ratio":0.0}
+
+Never omit any field. Never return partial JSON. Never add text outside the JSON object.\
 """
+
+def _price_fmt(price: float) -> str:
+    """Return a format spec appropriate for *price*.
+
+    BTC-range (>= 1000): 0 decimal places  → e.g. 65,432
+    Mid-range  (>= 1):   2 decimal places  → e.g. 3,421.56
+    Altcoin    (< 1):    4–6 sig-figs       → e.g. 0.001234
+    """
+    if price >= 1_000:
+        return f"{price:,.0f}"
+    if price >= 1:
+        return f"{price:,.2f}"
+    # Find first significant digit position
+    import math
+    if price <= 0:
+        return f"{price}"
+    sig_places = max(4, -int(math.floor(math.log10(abs(price)))) + 3)
+    return f"{price:.{sig_places}f}"
 
 
 def format_ohlcv_table(df, n: int = 10) -> str:
-    """Return last N candles as a compact markdown table."""
+    """Return last N candles as a compact markdown table.
+
+    Uses adaptive price formatting so sub-$1 alts (XRP/TRX) are not rounded
+    to 0 or 1 — that previously caused the LLM to PASS on "zeroed candles".
+    """
     if df is None or len(df) == 0:
         return "_No candle data available_"
     recent = df.tail(n).copy()
@@ -51,10 +98,15 @@ def format_ohlcv_table(df, n: int = 10) -> str:
     lines.append("|------|------|------|-----|-------|--------|")
     for ts, row in recent.iterrows():
         t = str(ts)[:16] if hasattr(ts, '__str__') else str(ts)
+        o = float(row.get('open', 0) or 0)
+        h = float(row.get('high', 0) or 0)
+        l = float(row.get('low', 0) or 0)
+        c = float(row.get('close', 0) or 0)
+        v = float(row.get('volume', 0) or 0)
         lines.append(
-            f"| {t} | {row.get('open', 0):,.0f} | {row.get('high', 0):,.0f} "
-            f"| {row.get('low', 0):,.0f} | {row.get('close', 0):,.0f} "
-            f"| {row.get('volume', 0):,.1f} |"
+            f"| {t} | {_price_fmt(o)} | {_price_fmt(h)} "
+            f"| {_price_fmt(l)} | {_price_fmt(c)} "
+            f"| {v:,.1f} |"
         )
     return "\n".join(lines)
 
@@ -173,7 +225,7 @@ def build_prompt(
     # 7. Confluence score breakdown
     sections.append(f"\n## Confluence Score\nDirection: {confluence.direction.upper()}")
     sections.append(f"Net Score: {confluence.net_score} (Bullish={confluence.bullish_score}, Bearish={confluence.bearish_score})")
-    sections.append(f"Meets Threshold (≥8): {'YES' if confluence.meets_threshold else 'NO'}")
+    sections.append(f"Meets Threshold (≥{MIN_CONFLUENCE_SCORE}): {'YES' if confluence.meets_threshold else 'NO'}")
     if confluence.factors:
         sections.append("\nFactors:")
         for f in sorted(confluence.factors, key=lambda x: -x.weight):
@@ -248,8 +300,29 @@ def build_prompt(
             for article in news[:5]:
                 sections.append(f"- [{article.get('source', '?')}] {article.get('title', '?')}")
 
-    # 13. Final instruction
-    sections.append("\n---\nBased on the above analysis, provide your trading signal as JSON.")
+        # Sprint 13: Active strategy signals (entry refinement context for LLM)
+        # main.py injects a pre-formatted string under 'strategy_signals'.
+        # Without this block the multi-strategy layer was invisible to the model.
+        strat_ctx = external_data.get('strategy_signals')
+        if strat_ctx:
+            sections.append(f"\n## Active Strategy Signals\n{strat_ctx}")
+            sections.append(
+                "Use strategy signals as entry refinement context. "
+                "Prefer the strategy's entry/SL/TP when structure agrees; "
+                "PASS if strategy direction conflicts with 5m structure or confluence is weak."
+            )
+
+    # 13. Final instruction — re-state schema requirements immediately before
+    # the model generates its response. This is the highest-weight instruction
+    # for models that front-load the system prompt and lose it mid-context.
+    sections.append(
+        "\n---\n"
+        "Respond with ONLY a single JSON object. ALL fields are required:\n"
+        "signal, confidence, entry, stop_loss, tp1, tp2, tp3, "
+        "reasoning, key_risk, timeframe, rr_ratio.\n"
+        "For PASS: set entry/stop_loss/tp1/tp2/tp3 to current price, rr_ratio=0.0.\n"
+        "Do not omit any field. Do not add text outside the JSON."
+    )
 
     user_prompt = "\n".join(sections)
     return SYSTEM_PROMPT, user_prompt

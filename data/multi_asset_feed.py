@@ -55,13 +55,21 @@ class MultiAssetFeed:
     DEFAULT_TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"]
     DEFAULT_HISTORY_BARS = 300
 
-    def __init__(self, db_path: str, on_tick: Callable[[str, float], None]):
+    def __init__(
+        self,
+        db_path: str,
+        on_tick: Callable[[str, float], None],
+        on_trade: Optional[Callable[[str, dict], None]] = None,
+    ):
         """
         db_path:  path to the SQLite database (passed through to DataFetcher)
         on_tick:  called as on_tick(symbol, price) for every incoming tick
+        on_trade: optional callback for raw trade ticks — on_trade(symbol, tick_dict)
+                  Used by OrderFlowAccumulator for delta / CVD accumulation.
         """
         self._db_path  = db_path
         self._on_tick  = on_tick
+        self._on_trade = on_trade
         # symbol (upper, slash-normalised) -> AssetFeedState
         self._states: dict[str, AssetFeedState] = {}
 
@@ -181,6 +189,13 @@ class MultiAssetFeed:
         # Build the WebSocketFeed with a closure that captures this symbol
         def make_on_tick(sym: str, st: AssetFeedState):
             def _on_tick(tick: dict):
+                # Forward trade ticks to order-flow accumulator (if wired)
+                if tick.get("type") == "trade" and self._on_trade is not None:
+                    try:
+                        self._on_trade(sym, tick)
+                    except Exception as exc:
+                        logger.error("[MAF] on_trade callback error for %s: %s", sym, exc)
+
                 price = _extract_price(tick)
                 if price is None:
                     return

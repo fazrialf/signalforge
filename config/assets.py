@@ -103,51 +103,65 @@ class AssetConfig:
 
 ASSETS: list[AssetConfig] = [
     # --- Large-cap crypto -------------------------------------------------- #
+    # lookback_bars applies to primary+higher TFs (5m/15m/1h).
+    # 1m is hard-capped at 120 bars in DataFetcher + SQL load path.
     AssetConfig(
         symbol="BTC/USDT",
         binance_symbol="BTCUSDT",
-        timeframes=["1h", "4h", "1d"],
-        primary_tf="1h",
-        description="Bitcoin — primary asset",
+        timeframes=["1m", "5m", "15m", "1h"],
+        primary_tf="5m",
+        lookback_bars=300,
+        cooldown_minutes=10,
+        description="Bitcoin — primary asset (scalping)",
     ),
     AssetConfig(
         symbol="ETH/USDT",
         binance_symbol="ETHUSDT",
-        timeframes=["1h", "4h", "1d"],
-        primary_tf="1h",
-        description="Ethereum",
+        timeframes=["1m", "5m", "15m", "1h"],
+        primary_tf="5m",
+        lookback_bars=300,
+        cooldown_minutes=10,
+        description="Ethereum (scalping)",
     ),
     AssetConfig(
         symbol="BNB/USDT",
         binance_symbol="BNBUSDT",
-        timeframes=["1h", "4h", "1d"],
-        primary_tf="1h",
-        description="BNB",
+        timeframes=["1m", "5m", "15m", "1h"],
+        primary_tf="5m",
+        lookback_bars=300,
+        cooldown_minutes=10,
+        description="BNB (scalping)",
     ),
     # --- Mid-cap / high-beta ----------------------------------------------- #
     AssetConfig(
         symbol="SOL/USDT",
         binance_symbol="SOLUSDT",
-        timeframes=["1h", "4h", "1d"],
-        primary_tf="1h",
-        min_confluence_score=9,   # slightly tighter — more volatile
-        description="Solana",
+        timeframes=["1m", "5m", "15m", "1h"],
+        primary_tf="5m",
+        lookback_bars=300,
+        cooldown_minutes=10,
+        min_confluence_score=7,   # slightly tighter — more volatile
+        description="Solana (scalping)",
         enabled=True,
     ),
     AssetConfig(
         symbol="XRP/USDT",
         binance_symbol="XRPUSDT",
-        timeframes=["1h", "4h", "1d"],
-        primary_tf="1h",
-        description="XRP",
+        timeframes=["1m", "5m", "15m", "1h"],
+        primary_tf="5m",
+        lookback_bars=300,
+        cooldown_minutes=10,
+        description="XRP (scalping)",
         enabled=True,
     ),
     AssetConfig(
         symbol="TRX/USDT",
         binance_symbol="TRXUSDT",
-        timeframes=["1h", "4h", "1d"],
-        primary_tf="1h",
-        description="TRON",
+        timeframes=["1m", "5m", "15m", "1h"],
+        primary_tf="5m",
+        lookback_bars=300,
+        cooldown_minutes=10,
+        description="TRON (scalping)",
     ),
 ]
 

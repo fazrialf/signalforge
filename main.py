@@ -47,7 +47,16 @@ from monitoring.health_endpoint import HealthServer
 from core.session_marker import (
     get_current_session, get_session_opens_in_window,
     format_session_label, format_session_open_alert,
+    calc_asia_range,
 )
+from core.vwap import calc_vwap, VWAPState
+from core.smc import detect_equal_levels, get_swept_reclaimed_levels
+from data.order_flow import OrderFlowAccumulator
+from strategies.vwap_reversion import evaluate_vwap_reversion
+from strategies.sweep_reclaim import evaluate_sweep_reclaim
+from strategies.delta_divergence import evaluate_delta_divergence
+from strategies.session_breakout import evaluate_session_breakout
+from strategies.micro_fvg import evaluate_micro_fvg, detect_micro_fvgs
 from config.settings import (
     MIN_CONFLUENCE_SCORE, MIN_LLM_CONFIDENCE, MIN_RR_RATIO,
     ACCOUNT_BALANCE, COOLDOWN_MINUTES, SWING_LOOKBACK,
@@ -65,13 +74,16 @@ except ImportError:
 
 # --- Logging -------------------------------------------------------
 os.makedirs(Path(LOG_PATH).parent, exist_ok=True)
+# FileHandler only — systemd unit already appends stdout to the same
+# log file (StandardOutput=append:…/signalforge.log).  Keeping both
+# StreamHandler + FileHandler doubles every line.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.FileHandler(LOG_PATH),
-        logging.StreamHandler(sys.stdout)
-    ]
+    ],
+    force=True,
 )
 logger = logging.getLogger("signalforge")
 
@@ -145,12 +157,37 @@ async def main():
     # 4. Start WebSocket feeds for all enabled assets
     logger.info("[4/5] Starting WebSocket feeds...")
 
+    # --- Strategy Infrastructure (created before WS so on_trade can bind) ---
+    # Order flow accumulator for delta divergence strategy (5m bars)
+    order_flow = OrderFlowAccumulator(bar_interval_ms=300_000, max_bars=100)
+
     # Shared on_tick callback — updates latest_prices dict
     def on_tick(symbol: str, price: float) -> None:
         latest_prices[symbol] = price
 
-    # Create MultiAssetFeed with the shared callback
-    ws_feed = MultiAssetFeed(db_path=DB_PATH, on_tick=on_tick)
+    # Shared on_trade callback — feeds OrderFlowAccumulator from WS trade stream
+    def on_trade(symbol: str, tick: dict) -> None:
+        """Route Binance trade ticks into the delta accumulator.
+
+        tick fields from WebSocketFeed:
+          price, qty, side ('buy'|'sell'), ts (ms)
+        is_buyer_maker = True when side == 'sell' (taker sold into maker bid).
+        """
+        try:
+            price = float(tick.get("price") or 0)
+            qty = float(tick.get("qty") or 0)
+            if price <= 0 or qty <= 0:
+                return
+            is_buyer_maker = str(tick.get("side", "")).lower() == "sell"
+            ts = int(tick.get("ts") or 0)
+            if ts <= 0:
+                return
+            order_flow.on_trade(symbol, price, qty, is_buyer_maker, ts)
+        except Exception as exc:
+            logger.debug("[ORDER_FLOW] on_trade error for %s: %s", symbol, exc)
+
+    # Create MultiAssetFeed with price + trade callbacks
+    ws_feed = MultiAssetFeed(db_path=DB_PATH, on_tick=on_tick, on_trade=on_trade)
 
     # Build asset configs for WebSocket
     ws_asset_configs = [
@@ -207,6 +244,12 @@ async def main():
     # S-3: BOS retest watcher — per-symbol state machine, lives for the session
     bos_watcher = BOSRetestWatcher()
 
+    # Fix-3: Consecutive PASS tracker — suppresses LLM calls after 3 identical
+    # PASS results for the same symbol. Prevents token waste on choppy markets.
+    _pass_tracker: dict[str, int] = {}  # symbol → consecutive PASS count
+    _PASS_COOLDOWN_THRESHOLD = 3   # after this many PASS results, suppress
+    _PASS_COOLDOWN_CYCLES = 5      # skip this many cycles before retrying
+
     async def run_smc_pipeline():
         nonlocal last_structure_broadcast, latest_prices, active_positions, last_session_check
         while True:
@@ -228,13 +271,25 @@ async def main():
                     # Reload fresh OHLCV from DB for this symbol — one
                     # connection per symbol, closed when the with-block exits.
                     fresh_data = {}
+                    # Cap bars loaded per TF — full ASC history was memory bloat.
+                    # 1m: ~2h for micro-FVG only; higher TFs: asset lookback_bars.
+                    # Keep in sync with data.fetcher.LOOKBACK_1M_BARS (120).
+                    _tf_limits = {
+                        "1m": 120,
+                        "5m": min(int(getattr(a, "lookback_bars", 500) or 500), 500),
+                        "15m": min(int(getattr(a, "lookback_bars", 500) or 500), 400),
+                        "1h": min(int(getattr(a, "lookback_bars", 500) or 500), 300),
+                    }
                     with sqlite3.connect(DB_PATH, timeout=10) as _conn:
                         for tf in a.timeframes:
+                            limit = _tf_limits.get(tf, int(getattr(a, "lookback_bars", 500) or 500))
                             rows = _conn.execute(
                                 "SELECT ts, open, high, low, close, volume "
                                 "FROM candles WHERE timeframe = ? AND symbol = ? "
-                                "ORDER BY ts ASC", (tf, symbol)
+                                "ORDER BY ts DESC LIMIT ?",
+                                (tf, symbol, limit),
                             ).fetchall()
+                            rows = list(reversed(rows))  # restore ASC order
                             if rows:
                                 df_fresh = pd.DataFrame(
                                     rows, columns=["ts", "open", "high", "low", "close", "volume"]
@@ -249,7 +304,10 @@ async def main():
                                 fresh_data[tf] = cached.get(tf) if cached else pd.DataFrame()
 
                     price = latest_prices.get(symbol, 0.0)
-                    results = analyse_all_timeframes(fresh_data, current_price=price)
+                    # Skip full SMC on 1m — only raw candles needed for Micro-FVG.
+                    results = analyse_all_timeframes(
+                        fresh_data, current_price=price, skip_timeframes={"1m"}
+                    )
 
                     # Log a summary of what we found
                     for tf, r in results.items():
@@ -304,7 +362,7 @@ async def main():
                     mtf_bias = check_mtf_bias(results)
                     primary_r = results.get(primary_tf)
                     if primary_r:
-                        confluence = score_confluence(primary_r, mtf_aligned=mtf_bias.aligned, threshold=MIN_CONFLUENCE_SCORE)
+                        confluence = score_confluence(primary_r, mtf_aligned=mtf_bias.aligned, threshold=MIN_CONFLUENCE_SCORE, mtf_bias=mtf_bias)
                         logger.info(
                             "[CONFLUENCE] %s %s | net=%d | bull=%d | bear=%d | threshold=%s",
                             symbol, confluence.dominant_direction.upper(),
@@ -314,22 +372,253 @@ async def main():
                             'YES' if confluence.meets_threshold else 'no',
                         )
 
-                        if confluence.meets_threshold:
-                            # S-3: BOS retest gate — suppress LLM until price
-                            # pulls back into the FVG/OB left by the BOS impulse
-                            retest_ok, retest_reason = bos_watcher.update(
-                                symbol=symbol,
-                                primary_r=primary_r,
-                                current_price=price,
-                            )
-                            if not retest_ok:
-                                logger.info(
-                                    "[BOS_RETEST] %s LLM suppressed — %s",
-                                    symbol, retest_reason,
-                                )
-                                continue
+                        # --- Multi-Strategy Evaluation ---
+                        # Run all 5 strategies in parallel with BOS retest.
+                        # If any strategy fires, it enriches the LLM prompt.
+                        strategy_signals = []
+                        primary_df = fresh_data.get(primary_tf)
+                        df_1m = fresh_data.get("1m")
+                        vwap_state = None  # shared by VWAP + Delta strategies
 
-                            logger.info("[LLM] %s confluence threshold met — calling GPT-4o...", symbol)
+                        # Strategy 1: VWAP Mean Reversion
+                        try:
+                            vwap_state = calc_vwap(primary_df, anchor_hour_utc=0)
+                            squeeze_firing = primary_r.squeeze_firing if primary_r else False
+                            vwap_sig = evaluate_vwap_reversion(
+                                primary_df, vwap_state=vwap_state,
+                                squeeze_firing=squeeze_firing, atr_spike=False,
+                            )
+                            if vwap_sig:
+                                strategy_signals.append(("VWAP_REVERSION", vwap_sig))
+                                logger.info("[STRAT] %s VWAP Reversion: %s conf=%d RR=%.1f",
+                                            symbol, vwap_sig.direction, vwap_sig.confidence, vwap_sig.rr_ratio)
+                        except Exception as e:
+                            vwap_state = None
+                            logger.debug("[STRAT] %s VWAP error: %s", symbol, e)
+
+                        # Strategy 2: Sweep + Reclaim
+                        try:
+                            swings = primary_r.swing_points if primary_r else []
+                            sweep_sig = evaluate_sweep_reclaim(
+                                primary_df, swings=swings, current_price=price,
+                            )
+                            if sweep_sig:
+                                strategy_signals.append(("SWEEP_RECLAIM", sweep_sig))
+                                logger.info("[STRAT] %s Sweep+Reclaim: %s conf=%d RR=%.1f",
+                                            symbol, sweep_sig.direction, sweep_sig.confidence, sweep_sig.rr_ratio)
+                        except Exception as e:
+                            logger.debug("[STRAT] %s Sweep error: %s", symbol, e)
+
+                        # Strategy 3: Delta Divergence
+                        try:
+                            # Health breadcrumb: prove WS trades are accumulating
+                            # (logs even before first 5m bar closes)
+                            live = order_flow.get_live_snapshot(symbol)
+                            if live["current_trades"] > 0 or live["completed_bars"] > 0:
+                                logger.info(
+                                    "[ORDER_FLOW] %s trades=%d bars=%d "
+                                    "cur_delta=%.2f cum_delta=%.2f buy=%.2f sell=%.2f",
+                                    symbol,
+                                    live["current_trades"],
+                                    live["completed_bars"],
+                                    live["current_delta"],
+                                    live["cum_delta"],
+                                    live["current_buy_vol"],
+                                    live["current_sell_vol"],
+                                )
+                            delta_state = order_flow.get_state(symbol)
+                            nearest_sup = None
+                            nearest_res = None
+                            if primary_r and primary_r.sr_levels:
+                                supports = [s for s in primary_r.sr_levels if s.type == 'support' and s.price < price]
+                                resists = [s for s in primary_r.sr_levels if s.type == 'resistance' and s.price > price]
+                                if supports:
+                                    nearest_sup = max(s.price for s in supports)
+                                if resists:
+                                    nearest_res = min(s.price for s in resists)
+                            delta_sig = evaluate_delta_divergence(
+                                primary_df, delta_state=delta_state,
+                                current_price=price,
+                                nearest_support=nearest_sup,
+                                nearest_resistance=nearest_res,
+                                vwap=vwap_state.vwap if vwap_state else None,
+                            )
+                            if delta_sig:
+                                strategy_signals.append(("DELTA_DIVERGENCE", delta_sig))
+                                logger.info("[STRAT] %s Delta Divergence: %s conf=%d RR=%.1f",
+                                            symbol, delta_sig.direction, delta_sig.confidence, delta_sig.rr_ratio)
+                        except Exception as e:
+                            logger.debug("[STRAT] %s Delta error: %s", symbol, e)
+
+                        # Strategy 4: Session Breakout
+                        try:
+                            asia_range = calc_asia_range(primary_df, utc_now=now_utc)
+                            session_sig = evaluate_session_breakout(
+                                primary_df, symbol=symbol,
+                                current_price=price, asia_range=asia_range,
+                                utc_now=now_utc,
+                            )
+                            if session_sig:
+                                strategy_signals.append(("SESSION_BREAKOUT", session_sig))
+                                logger.info("[STRAT] %s Session Breakout: %s conf=%d RR=%.1f (%s open)",
+                                            symbol, session_sig.direction, session_sig.confidence,
+                                            session_sig.rr_ratio, session_sig.session_trigger)
+                        except Exception as e:
+                            logger.debug("[STRAT] %s Session error: %s", symbol, e)
+
+                        # Strategy 5: Micro-FVG Stacking (refinement only — requires parent zone)
+                        try:
+                            if df_1m is not None and len(df_1m) > 20 and primary_r:
+                                # Use nearest 5m FVG as parent zone — REQUIRED
+                                parent_type = "FVG"
+                                parent_top = None
+                                parent_bottom = None
+                                if primary_r.active_fvgs:
+                                    nearest_fvg = min(primary_r.active_fvgs,
+                                                     key=lambda f: abs(f.midpoint - price))
+                                    parent_top = nearest_fvg.top
+                                    parent_bottom = nearest_fvg.bottom
+                                elif primary_r.active_obs:
+                                    nearest_ob = min(primary_r.active_obs,
+                                                    key=lambda o: abs(o.midpoint - price))
+                                    parent_top = nearest_ob.top
+                                    parent_bottom = nearest_ob.bottom
+                                    parent_type = "OB"
+
+                                # Skip Micro-FVG entirely if no parent zone nearby
+                                if parent_top is not None and parent_bottom is not None:
+                                    structure_bias = None
+                                    if primary_r.structure and primary_r.structure.bias:
+                                        structure_bias = getattr(
+                                            primary_r.structure.bias, "value",
+                                            str(primary_r.structure.bias),
+                                        )
+                                    micro_sig = evaluate_micro_fvg(
+                                        primary_df, df_1m, current_price=price,
+                                        parent_zone_type=parent_type,
+                                        parent_zone_top=parent_top,
+                                        parent_zone_bottom=parent_bottom,
+                                        require_parent_zone=True,
+                                        require_price_in_zone=True,
+                                        structure_bias=structure_bias,
+                                    )
+                                    if micro_sig:
+                                        strategy_signals.append(("MICRO_FVG", micro_sig))
+                                        logger.info("[STRAT] %s Micro-FVG: %s conf=%d RR=%.1f (%d FVGs stacked)",
+                                                    symbol, micro_sig.direction, micro_sig.confidence,
+                                                    micro_sig.rr_ratio, micro_sig.fvg_count)
+                        except Exception as e:
+                            logger.debug("[STRAT] %s Micro-FVG error: %s", symbol, e)
+
+                        # Log strategy summary
+                        if strategy_signals:
+                            logger.info("[STRAT] %s — %d strategy signal(s) active: %s",
+                                        symbol, len(strategy_signals),
+                                        ", ".join(s[0] for s in strategy_signals))
+
+                        # --- Decision: BOS retest OR strategy signal triggers LLM ---
+                        should_call_llm = False
+                        llm_trigger_reason = ""
+
+                        if confluence.meets_threshold:
+                            # Fix-3: Skip LLM if this symbol has been returning PASS repeatedly
+                            pass_count = _pass_tracker.get(symbol, 0)
+                            if pass_count >= _PASS_COOLDOWN_THRESHOLD:
+                                # Decrement counter each skipped cycle; when it reaches 0, retry
+                                _pass_tracker[symbol] = pass_count - 1
+                                logger.info(
+                                    "[PASS_COOLDOWN] %s skipping LLM — %d consecutive PASS results "
+                                    "(retry in %d cycles)",
+                                    symbol, _PASS_COOLDOWN_THRESHOLD, pass_count - 1,
+                                )
+                            else:
+                                # S-3: BOS retest gate — suppress LLM until price
+                                # pulls back into the FVG/OB left by the BOS impulse
+                                retest_ok, retest_reason = bos_watcher.update(
+                                    symbol=symbol,
+                                    primary_r=primary_r,
+                                    current_price=price,
+                                )
+                                if retest_ok:
+                                    should_call_llm = True
+                                    llm_trigger_reason = "confluence+bos_retest"
+                                else:
+                                    logger.info(
+                                        "[BOS_RETEST] %s LLM suppressed — %s",
+                                        symbol, retest_reason,
+                                    )
+
+                        # Strategy signals can independently trigger LLM, but with
+                        # per-strategy confidence floors (Sprint 13 — stop Micro-FVG spam).
+                        # MICRO_FVG is refinement-only: needs higher conf OR confluence support.
+                        _STRAT_LLM_MIN_CONF = {
+                            "MICRO_FVG": 80,
+                            "VWAP_REVERSION": 70,
+                            "SWEEP_RECLAIM": 65,
+                            "SESSION_BREAKOUT": 65,
+                            "DELTA_DIVERGENCE": 70,
+                        }
+                        if not should_call_llm and strategy_signals:
+                            # Prefer non-micro strategies when available
+                            ranked = sorted(
+                                strategy_signals,
+                                key=lambda s: (
+                                    0 if s[0] != "MICRO_FVG" else 1,
+                                    -s[1].confidence,
+                                ),
+                            )
+                            best_strat = ranked[0]
+                            sname, ssig = best_strat
+                            min_conf = _STRAT_LLM_MIN_CONF.get(sname, 70)
+
+                            # Micro-FVG may also trigger at 70+ IF confluence already
+                            # supports the same direction (net score ≥ 4).
+                            micro_boost_ok = False
+                            if sname == "MICRO_FVG" and confluence is not None:
+                                same_dir = (
+                                    (ssig.direction == "BUY" and confluence.net_score >= 4)
+                                    or (ssig.direction == "SELL" and confluence.net_score <= -4)
+                                )
+                                micro_boost_ok = same_dir and ssig.confidence >= 70
+
+                            if ssig.confidence >= min_conf or micro_boost_ok:
+                                # Strategy-level PASS cooldown still applies
+                                pass_count = _pass_tracker.get(symbol, 0)
+                                if pass_count >= _PASS_COOLDOWN_THRESHOLD:
+                                    _pass_tracker[symbol] = pass_count - 1
+                                    logger.info(
+                                        "[PASS_COOLDOWN] %s skipping strategy LLM (%s) — "
+                                        "cooldown active (retry in %d)",
+                                        symbol, sname, pass_count - 1,
+                                    )
+                                else:
+                                    should_call_llm = True
+                                    boost_tag = "+confluence_boost" if (
+                                        micro_boost_ok and ssig.confidence < min_conf
+                                    ) else ""
+                                    llm_trigger_reason = f"strategy:{sname}{boost_tag}"
+                                    logger.info(
+                                        "[STRAT] %s triggering LLM via %s (conf=%d, min=%d%s)",
+                                        symbol, sname, ssig.confidence, min_conf,
+                                        ", confluence_boost" if boost_tag else "",
+                                    )
+                            else:
+                                logger.info(
+                                    "[STRAT] %s %s conf=%d below min=%d — no LLM",
+                                    symbol, sname, ssig.confidence, min_conf,
+                                )
+
+                        if not should_call_llm:
+                            if not confluence.meets_threshold:
+                                logger.debug(
+                                    "[CONFLUENCE] %s Score %d below threshold %d — skipping LLM call",
+                                    symbol, abs(confluence.net_score), MIN_CONFLUENCE_SCORE,
+                                )
+                            continue
+
+                        if should_call_llm:
+
+                            logger.info("[LLM] %s triggering LLM — reason: %s", symbol, llm_trigger_reason)
 
                             # --- Fetch external data ---
                             external_data = {}
@@ -339,11 +628,11 @@ async def main():
                                 except Exception as e:
                                     logger.warning("[EXT] Fear & Greed fetch failed: %s", e)
                                 try:
-                                    external_data['onchain'] = fetch_onchain_metrics()
+                                    external_data['onchain'] = await asyncio.to_thread(fetch_onchain_metrics)
                                 except Exception as e:
                                     logger.warning("[EXT] On-chain fetch failed: %s", e)
                                 try:
-                                    external_data['correlations'] = fetch_correlations()
+                                    external_data['correlations'] = await asyncio.to_thread(fetch_correlations)
                                 except Exception as e:
                                     logger.warning("[EXT] Correlations fetch failed: %s", e)
                                 try:
@@ -352,7 +641,20 @@ async def main():
                                 except Exception as e:
                                     logger.warning("[EXT] News fetch failed: %s", e)
 
-                            primary_df = fresh_data.get(primary_tf)
+                            # Build strategy context string for LLM prompt
+                            strat_context = ""
+                            if strategy_signals:
+                                strat_lines = ["\n--- ACTIVE STRATEGY SIGNALS ---"]
+                                for sname, ssig in strategy_signals:
+                                    strat_lines.append(
+                                        f"[{sname}] {ssig.direction} | Entry=${ssig.entry:.4f} | "
+                                        f"SL=${ssig.stop_loss:.4f} | TP1=${ssig.tp1:.4f} | "
+                                        f"R:R={ssig.rr_ratio:.1f} | Confidence={ssig.confidence}%"
+                                    )
+                                    strat_lines.append(f"  Reasoning: {ssig.reasoning}")
+                                strat_context = "\n".join(strat_lines)
+                                external_data['strategy_signals'] = strat_context
+
                             sys_prompt, usr_prompt = build_prompt(
                                 results=results,
                                 confluence=confluence,
@@ -375,6 +677,8 @@ async def main():
 
                             # --- Filter Gate ---
                             if signal.signal != "PASS":
+                                # Fix-3: Reset PASS counter on actionable signal
+                                _pass_tracker.pop(symbol, None)
                                 # Inject pre-fetched Fear & Greed so filter 9
                                 # doesn't make a blocking sync HTTP call
                                 if _EXTERNAL_AVAILABLE and 'fear_greed' in external_data:
@@ -385,6 +689,7 @@ async def main():
                                     symbol=symbol,
                                     active_positions=active_positions,
                                     current_price=price,
+                                    candles=primary_df,
                                 )
                                 filter_str = "delivered" if filter_result.passed else f"filtered: {filter_result.reason}"
                                 logger.info(
@@ -483,6 +788,8 @@ async def main():
                                     )
                             else:
                                 # PASS signal — still log it
+                                # Fix-3: Increment consecutive PASS counter
+                                _pass_tracker[symbol] = _pass_tracker.get(symbol, 0) + 1
                                 log_signal(
                                     signal=signal,
                                     symbol=symbol,
@@ -493,19 +800,15 @@ async def main():
                                 )
                                 if not signal.error:
                                     logger.info("[LLM] %s LLM returned PASS: %s", symbol, signal.reasoning[:100])
-                        else:
-                            logger.debug(
-                                "[CONFLUENCE] %s Score %d below threshold %d — skipping LLM call",
-                                symbol, abs(confluence.net_score), MIN_CONFLUENCE_SCORE,
-                            )
 
                     # Rate limit between assets to avoid LLM API burst
                     if asset_idx < len(enabled_assets) - 1:
                         await asyncio.sleep(3)
 
+                    # Fix-6: Explicitly release per-asset DataFrames to reduce memory pressure
+                    del fresh_data
+
                 # --- GAP FILL: Paper Engine Auto-Tick ---
-                # C-5: prune active_positions for any symbols the paper engine just closed
-                closed_symbols: set[str] = set()
                 for asset in enabled_assets:
                     try:
                         if paper_engine is None:
@@ -528,13 +831,16 @@ async def main():
                                 reason = t.get("reason", "?")
                                 pnl = t.get("pnl_usd", 0)
                                 logger.info("[PAPER] %s auto-closed: %s P&L=$%.2f", asset.symbol, reason, pnl)
-                                closed_symbols.add(asset.symbol)
                     except Exception as tick_err:
                         logger.warning("[PAPER] tick error for %s: %s", asset, tick_err)
-                # Remove closed symbols from active_positions so FilterGate heat check stays accurate
-                if closed_symbols:
-                    active_positions = [p for p in active_positions if p.get("symbol") not in closed_symbols]
-                    logger.debug("[C-5] Pruned active_positions — removed %d closed: %s", len(closed_symbols), closed_symbols)
+
+                # Source-of-truth rebuild after paper ticks (prevents ghost 3/3 blocks)
+                active_positions = _sync_active_positions_from_db()
+                logger.info(
+                    "[POSITION_SYNC] active=%d symbols=%s",
+                    len(active_positions),
+                    [p["symbol"] for p in active_positions],
+                )
 
                 logger.info("SMC analysis cycle complete for all %d assets.", len(enabled_assets))
                 health_server.set_health("pipeline", "ok", f"Cycle complete, {len(enabled_assets)} assets analyzed")
@@ -561,36 +867,56 @@ async def main():
             'max_heat': MAX_PORTFOLIO_HEAT_PCT,
         },
     )
-    active_positions: list[dict] = []   # C-5: pruned on each cycle — entries removed when paper engine closes them
+    active_positions: list[dict] = []   # rebuilt from DB each cycle (source of truth)
 
-    # M-3: Restore open positions from DB on startup so FilterGate heat/concurrent
-    # checks are accurate immediately after a restart, not just after the first close.
-    if PAPER_MODE:
+    def _sync_active_positions_from_db() -> list[dict]:
+        """Rebuild active_positions from OPEN paper_trades.
+
+        DB is source of truth — in-memory append/prune can drift after restarts,
+        duplicate opens, or closes that miss the paper tick path.
+        Dedupes by symbol (keeps newest open row) so concurrent-count is correct.
+        """
+        synced: list[dict] = []
         try:
             with sqlite3.connect(DB_PATH, timeout=5) as _rc:
                 _rc.row_factory = sqlite3.Row
                 _open_rows = _rc.execute(
-                    "SELECT symbol, direction, entry_price, sl, position_size "
-                    "FROM paper_trades WHERE status = 'OPEN'"
+                    "SELECT symbol, direction, entry_price, sl, position_size, opened_at "
+                    "FROM paper_trades WHERE status = 'OPEN' "
+                    "ORDER BY opened_at DESC"
                 ).fetchall()
+            seen: set[str] = set()
             for _row in _open_rows:
-                _sl_dist = abs(_row["entry_price"] - _row["sl"])
-                _risk_usd = _sl_dist * (_row["position_size"] or 0.0)
-                active_positions.append({
-                    "symbol":    _row["symbol"],
+                sym = _row["symbol"]
+                if sym in seen:
+                    continue  # keep newest open only per symbol
+                seen.add(sym)
+                _sl_dist = abs(float(_row["entry_price"]) - float(_row["sl"]))
+                _size = float(_row["position_size"] or 0.0)
+                _risk_usd = _sl_dist * _size
+                _risk_pct = (_risk_usd / ACCOUNT_BALANCE * 100.0) if ACCOUNT_BALANCE else 0.0
+                synced.append({
+                    "symbol":    sym,
                     "side":      _row["direction"],
-                    "entry":     _row["entry_price"],
-                    "stop_loss": _row["sl"],
+                    "entry":     float(_row["entry_price"]),
+                    "stop_loss": float(_row["sl"]),
+                    "sl":        float(_row["sl"]),
                     "risk_usd":  _risk_usd,
+                    "risk_pct":  _risk_pct,
                 })
-            if _open_rows:
-                logger.info(
-                    "[M-3] Restored %d open paper position(s) from DB: %s",
-                    len(_open_rows),
-                    [r["symbol"] for r in _open_rows],
-                )
         except Exception as _e:
-            logger.warning("[M-3] Could not restore active_positions from DB: %s", _e)
+            logger.warning("[POSITION_SYNC] DB sync failed, keeping previous list: %s", _e)
+            return list(active_positions)
+        return synced
+
+    # M-3: Restore open positions from DB on startup
+    active_positions = _sync_active_positions_from_db()
+    if active_positions:
+        logger.info(
+            "[M-3] Restored %d open paper position(s) from DB: %s",
+            len(active_positions),
+            [p["symbol"] for p in active_positions],
+        )
 
     # --- Position Tracker + Command Handler ---
     position_tracker = PositionTracker(db_path=str(DB_PATH))

@@ -272,6 +272,7 @@ def analyse_timeframe(
 def analyse_all_timeframes(
     data: dict[str, pd.DataFrame],
     current_price: Optional[float] = None,
+    skip_timeframes: Optional[set[str]] = None,
 ) -> dict[str, SMCAnalysisResult]:
     """
     Run SMC analysis on all available timeframes.
@@ -279,12 +280,19 @@ def analyse_all_timeframes(
     Args:
         data: dict of {timeframe: DataFrame} — as returned by DataFetcher.load_all()
         current_price: optional price override
+        skip_timeframes: optional set of TFs to skip (e.g. {"1m"}).
+            1m is only needed as raw candles for Micro-FVG stacking — full SMC
+            on 1m is expensive and was a major memory/CPU cost in scalping mode.
 
     Returns:
         dict of {timeframe: SMCAnalysisResult}
     """
+    skip = skip_timeframes or set()
     results = {}
     for tf, df in data.items():
+        if tf in skip:
+            continue
+
         # Determine lookback based on timeframe (higher TF = more bars needed)
         if tf in ("1d", "1w", "1M"):
             lb = 7
@@ -295,7 +303,7 @@ def analyse_all_timeframes(
         elif tf in ("15m", "30m"):
             lb = 4
         else:
-            lb = 3  # 1m, 5m — matches SWING_LOOKBACK=3 in config/settings.py (scalping default)
+            lb = 3  # 5m — matches SWING_LOOKBACK=3 in config/settings.py (scalping default)
 
         if len(df) < lb * 3:
             logger.warning("Not enough data for %s to run SMC analysis (%d bars, need %d)",

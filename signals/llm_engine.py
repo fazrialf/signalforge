@@ -17,6 +17,7 @@ from openai import AsyncOpenAI
 from config.settings import (
     OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL, OPENAI_FALLBACK,
     LLM_TIMEOUT, LLM_MAX_RETRIES, LLM_PROMPT_VERSION, LLM_MAX_CONCURRENT,
+    MIN_LLM_CONFIDENCE,
 )
 
 logger = logging.getLogger(__name__)
@@ -229,15 +230,14 @@ def _parse_llm_response(raw: str, model: str, latency_ms: int) -> SignalResult:
         sig     = str(data.get("signal", "PASS")).upper()
         llm_rr  = _f(data.get("rr_ratio"), 0)
 
-        # Recompute R:R from price levels whenever LLM returns 0 or omits it.
-        # Trusting LLM-provided rr_ratio is unreliable — recompute always when
-        # prices are available (entry/sl/tp1 all non-zero and entry != sl).
-        if entry and sl and tp1 and entry != sl and llm_rr == 0.0:
-            if sig == "BUY":
-                llm_rr = (tp1 - entry) / (entry - sl)
-            else:
-                llm_rr = (entry - tp1) / (entry - sl)
-            logger.info("[LLM] rr_ratio recomputed from prices (LLM returned 0): %.2f", llm_rr)
+        # Recompute R:R from price levels whenever prices are available.
+        # Always recompute — LLM-provided rr_ratio is unreliable (wrong sign,
+        # wrong formula, or zero). R:R is always a positive ratio: reward / risk.
+        if entry and sl and tp1 and entry != sl:
+            reward = abs(tp1 - entry)
+            risk   = abs(entry - sl)
+            llm_rr = reward / risk if risk > 0 else 0.0
+            logger.info("[LLM] rr_ratio recomputed from prices: %.2f", llm_rr)
 
         return SignalResult(
             signal=signal,
@@ -340,7 +340,7 @@ async def call_llm(
 async def get_signal(
     system_prompt: str,
     user_prompt: str,
-    min_confidence: float = 75.0,
+    min_confidence: float = MIN_LLM_CONFIDENCE,
 ) -> SignalResult:
     """High-level entry: call LLM and apply minimum confidence gate.
 

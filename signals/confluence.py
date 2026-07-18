@@ -22,6 +22,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 from signals.pipeline import SMCAnalysisResult
+from signals.mtf_bias import MTFBias
 from core.market_structure import Bias, StructureEvent
 
 logger = logging.getLogger(__name__)
@@ -139,6 +140,7 @@ def score_confluence(
     result: SMCAnalysisResult,
     mtf_aligned: bool = False,
     threshold: int = DEFAULT_THRESHOLD,
+    mtf_bias: Optional[MTFBias] = None,
 ) -> ConfluenceScore:
     """Evaluate confluence factors from an :class:`SMCAnalysisResult`.
 
@@ -164,18 +166,23 @@ def score_confluence(
     # ==================================================================
 
     # 1a. Market structure bias
+    # Track the bias direction to prevent double-counting with 1b BOS below.
+    _bias_direction: str | None = None
     if result.structure and result.structure.bias in (Bias.BULLISH, Bias.BEARISH):
-        direction = result.structure.bias.value  # 'bullish' or 'bearish'
-        _add(factors, f"bias_{direction}", 1, direction,
-             f"Market structure bias is {direction.upper()}")
+        _bias_direction = result.structure.bias.value  # 'bullish' or 'bearish'
+        _add(factors, f"bias_{_bias_direction}", 1, _bias_direction,
+             f"Market structure bias is {_bias_direction.upper()}")
 
     # 1b. Recent BOS → continuation
+    # Guard: skip if the BOS direction matches structure_bias already scored in 1a
+    # (same structural fact — counting it twice inflates the score by +3).
     if result.structure and result.structure.structure_breaks:
         latest = result.structure.structure_breaks[-1]
         if latest.event in (StructureEvent.BOS_BULL, StructureEvent.BOS_BEAR):
             direction = "bullish" if latest.event == StructureEvent.BOS_BULL else "bearish"
-            _add(factors, f"bos_{direction}", 1, direction,
-                 f"Break of Structure ({latest.event.value}) at ${latest.broke_level:,.2f}")
+            if direction != _bias_direction:
+                _add(factors, f"bos_{direction}", 1, direction,
+                     f"Break of Structure ({latest.event.value}) at ${latest.broke_level:,.2f}")
 
     # 1c. Recent ChOS → reversal
     if result.structure and result.structure.structure_breaks:
@@ -205,13 +212,26 @@ def score_confluence(
                      f"{ob.direction.capitalize()} Order Block "
                      f"${ob.bottom:,.2f}–${ob.top:,.2f} near price")
 
-    # 1f. MTF bias alignment
-    if mtf_aligned:
-        # Direction matches the structure bias if known, otherwise we skip
-        if result.structure and result.structure.bias in (Bias.BULLISH, Bias.BEARISH):
-            direction = result.structure.bias.value
-            _add(factors, "mtf_aligned", 1, direction,
-                 "Multi-timeframe bias alignment confirmed")
+    # 1e. MTF bias alignment — weight by strength so partial (2/3) alignment
+    # contributes proportionally rather than the same flat +3 as full alignment.
+    # strength=1.0 → weight 3, strength=0.67 → weight 2, strength=0.33 → weight 1
+    if mtf_aligned and mtf_bias is not None:
+        raw_w = max(1, round(mtf_bias.strength * TIER_WEIGHTS[1]))
+        direction_mtf = mtf_bias.dominant_direction if mtf_bias.dominant_direction in ("bullish", "bearish") else (
+            result.structure.bias.value if result.structure else "bullish"
+        )
+        factors.append(ConfluenceFactor(
+            name="mtf_aligned",
+            tier=1,
+            direction=direction_mtf,
+            weight=raw_w,
+            description=f"MTF bias aligned ({mtf_bias.summary}) strength={mtf_bias.strength:.2f} → weight {raw_w}",
+        ))
+    elif mtf_aligned:
+        # fallback: no MTFBias object passed, use flat weight
+        _add(factors, "mtf_aligned", 1,
+             result.structure.bias.value if result.structure else "bullish",
+             "Multi-timeframe bias aligned")
 
     # ==================================================================
     # TIER 2 — Trigger (weight = 2)

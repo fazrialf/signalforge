@@ -24,6 +24,7 @@ from config.settings import (
     MAX_CONCURRENT,
     MAX_PORTFOLIO_HEAT_PCT,
     DAILY_LOSS_LIMIT_PCT,
+    WEEKLY_LOSS_LIMIT_PCT,
     ACCOUNT_BALANCE,
 )
 from config.settings import (
@@ -173,10 +174,12 @@ class FilterGate:
             or self._f5_max_active(active_positions)
             or self._f6_portfolio_heat(active_positions)
             or self._f6b_daily_loss_limit(active_positions)
+            or self._f6c_weekly_loss_limit(active_positions)
             or self._f7_news_stub()
             or self._f8_atr_volatility(candles)
             or self._f9_fear_greed_stub()
             or self._f10_spread_stub()
+            or self._f12_momentum(signal, candles)
         )
 
         if result is not None:
@@ -446,6 +449,52 @@ class FilterGate:
         # TODO Sprint 7: block if (ask - bid) / mid_price > MAX_SPREAD_PCT
         return None
 
+    def _f12_momentum(self, signal: SignalResult, candles: Optional[pd.DataFrame]) -> Optional[FilterResult]:
+        """Filter 12: Block signals that go against short-term EMA9 momentum.
+
+        For scalping, entering against immediate momentum is the #1 cause of
+        false entries. This filter checks the slope of EMA9 over the last 3 bars:
+          - BUY signal requires EMA9 rising (slope > 0)
+          - SELL signal requires EMA9 falling (slope < 0)
+
+        When candles is None or too short, the filter skips (fail-safe pass).
+        """
+        if candles is None or len(candles) < 12:
+            return None  # not enough data
+
+        try:
+            close = candles["close"].astype(float)
+            ema9 = close.ewm(span=9, adjust=False).mean()
+
+            # Slope over last 3 bars — normalised by price to make threshold universal
+            slope = (ema9.iloc[-1] - ema9.iloc[-3]) / ema9.iloc[-3]
+
+            # Minimum slope threshold: 0.02% = market is actually moving directionally
+            min_slope = 0.0002
+
+            if signal.signal == "BUY" and slope < -min_slope:
+                return FilterResult(
+                    passed=False,
+                    reason=(
+                        f"Momentum against BUY: EMA9 slope={slope*100:.3f}% (falling) — "
+                        f"wait for momentum to turn"
+                    ),
+                    filter_name="filter_12_momentum",
+                )
+            elif signal.signal == "SELL" and slope > min_slope:
+                return FilterResult(
+                    passed=False,
+                    reason=(
+                        f"Momentum against SELL: EMA9 slope={slope*100:.3f}% (rising) — "
+                        f"wait for momentum to turn"
+                    ),
+                    filter_name="filter_12_momentum",
+                )
+        except Exception as e:
+            logger.warning("[FilterGate] F12 momentum check failed: %s — skipping", e)
+
+        return None
+
     def _f6b_daily_loss_limit(
         self, active_positions: list[dict]
     ) -> Optional[FilterResult]:
@@ -495,5 +544,55 @@ class FilterGate:
                     f"${daily_limit_usd:.2f} ({DAILY_LOSS_LIMIT_PCT}% of balance)"
                 ),
                 filter_name="filter_6b_daily_loss_limit",
+            )
+        return None
+
+    def _f6c_weekly_loss_limit(
+        self, active_positions: list[dict]
+    ) -> Optional[FilterResult]:
+        """Circuit breaker: block new signals if weekly realised loss exceeds limit.
+
+        Mirrors daily loss limit but over the last 7 UTC days (including today).
+        Blocks when total loss >= WEEKLY_LOSS_LIMIT_PCT of ACCOUNT_BALANCE.
+        """
+        weekly_limit_usd = ACCOUNT_BALANCE * (WEEKLY_LOSS_LIMIT_PCT / 100)
+
+        if self._db_path:
+            cutoff = (
+                datetime.datetime.now(datetime.timezone.utc)
+                - datetime.timedelta(days=7)
+            ).strftime("%Y-%m-%d")
+            try:
+                with sqlite3.connect(self._db_path, timeout=5) as conn:
+                    rows = conn.execute(
+                        """
+                        SELECT COALESCE(SUM(pnl_usd), 0.0)
+                        FROM   paper_trades
+                        WHERE  status = 'closed'
+                          AND  pnl_usd < 0
+                          AND  DATE(closed_at) >= ?
+                        """,
+                        (cutoff,),
+                    ).fetchone()
+                week_loss = rows[0] if rows else 0.0
+            except Exception as exc:
+                logger.warning("[FilterGate] weekly-loss DB query failed: %s", exc)
+                week_loss = 0.0
+        else:
+            # No DB — fall back to active_positions (unit-test mode)
+            week_loss = sum(
+                p.get("realised_pnl", 0.0)
+                for p in active_positions
+                if p.get("realised_pnl", 0.0) < 0
+            )
+
+        if abs(week_loss) >= weekly_limit_usd:
+            return FilterResult(
+                passed=False,
+                reason=(
+                    f"Weekly loss limit reached: ${abs(week_loss):.2f} >= "
+                    f"${weekly_limit_usd:.2f} ({WEEKLY_LOSS_LIMIT_PCT}% of balance)"
+                ),
+                filter_name="filter_6c_weekly_loss_limit",
             )
         return None

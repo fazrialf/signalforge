@@ -65,9 +65,13 @@ class WebSocketFeed:
             await self._ws_session.close()
 
     async def _connect(self):
-        """Connect to Binance WebSocket and stream kline + trade data."""
-        # Subscribe to 1m klines + trade stream
-        stream = f"{self.symbol}@kline_1m/{self.symbol}@trade"
+        """Connect to Binance WebSocket and stream kline + aggTrade data."""
+        # Subscribe to 1m klines + aggTrade stream.
+        # aggTrade bundles fills at the same price/time into one message,
+        # which is what OrderFlowAccumulator.on_trade() expects for
+        # accurate delta / CVD calculation.  Raw @trade sends each fill
+        # individually — noisier and higher bandwidth for no benefit.
+        stream = f"{self.symbol}@kline_1m/{self.symbol}@aggTrade"
         url    = f"{BINANCE_WS_BASE}/{stream}"
 
         logger.info("[WS] Connecting to %s", url)
@@ -111,14 +115,16 @@ class WebSocketFeed:
                     "is_closed": kline["x"],  # True = candle closed
                     "interval":  kline["i"],
                 }
-            elif event_type == "trade":
+            elif event_type == "aggTrade":
+                # aggTrade bundles fills at the same price/time/side.
+                # Fields: p=price, q=aggregate_qty, T=trade_time, m=is_buyer_maker
                 tick = {
-                    "type":   "trade",
+                    "type":   "trade",  # downstream consumers key on "trade"
                     "symbol": self.symbol.upper(),
                     "ts":     data["T"],  # trade time ms
                     "price":  float(data["p"]),
                     "qty":    float(data["q"]),
-                    "side":   "sell" if data["m"] else "buy",  # m=True means sell
+                    "side":   "sell" if data["m"] else "buy",  # m=True → taker sold
                 }
             else:
                 return  # unknown event type, skip

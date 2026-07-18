@@ -17,6 +17,13 @@ from db.schema import get_conn
 logger = logging.getLogger(__name__)
 
 
+# Micro-TF lookback — 1m only needs ~2 hours for micro-FVG stacking.
+# Full HISTORY_BARS (500) on 1m × 6 assets was the main memory bloat source.
+# 120 bars ≈ 2h of 1m context; enough for 3–5 stacked micro FVGs without
+# pushing RSS toward the 1.1–1.2GB MemoryMax ceiling.
+LOOKBACK_1M_BARS = 120
+
+
 class DataFetcher:
     def __init__(self, symbol: str, timeframes: list[str],
                  history_bars: int = 300):
@@ -26,6 +33,12 @@ class DataFetcher:
         self.exchange    = ccxt.binance({"enableRateLimit": True})
         # In-memory cache: {tf: pd.DataFrame}
         self._cache: dict[str, pd.DataFrame] = {}
+
+    def _bars_for_tf(self, timeframe: str) -> int:
+        """Return lookback bar count for a timeframe (1m is intentionally short)."""
+        if timeframe == "1m":
+            return LOOKBACK_1M_BARS
+        return self.history_bars
 
     async def close(self):
         await self.exchange.close()
@@ -82,7 +95,7 @@ class DataFetcher:
     async def load_all(self) -> dict[str, pd.DataFrame]:
         """Fetch history for all configured timeframes."""
         tasks = [
-            self.fetch_ohlcv(tf, limit=self.history_bars)
+            self.fetch_ohlcv(tf, limit=self._bars_for_tf(tf))
             for tf in self.timeframes
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)

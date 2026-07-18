@@ -10,6 +10,21 @@ from datetime import datetime, timezone
 logger = logging.getLogger(__name__)
 
 
+def _html_escape(text: str) -> str:
+    """Escape characters that break Telegram HTML parse_mode.
+
+    Telegram HTML only recognises <, >, & as special — apostrophes and
+    quotes are safe.  Escaping them prevents 'Bad Request: can't parse
+    entities' 400 errors when LLM reasoning contains raw < > & chars.
+    """
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
 class TelegramBot:
     def __init__(self, token: str, chat_id: str):
         self.token   = token
@@ -30,24 +45,35 @@ class TelegramBot:
             self._session = None
 
     async def send(self, text: str, parse_mode: str = "HTML") -> bool:
-        """Send a message. Returns True on success."""
+        """Send a message with 1x retry on failure. Returns True on success."""
         url     = f"{self.base}/sendMessage"
         payload = {
             "chat_id":    self.chat_id,
             "text":       text,
             "parse_mode": parse_mode,
         }
-        try:
-            session = await self._get_session()
-            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    return True
-                body = await resp.text()
-                logger.error("Telegram send failed %s: %s", resp.status, body)
-                return False
-        except Exception as e:
-            logger.error("Telegram exception: %s", e)
-            return False
+        # L-2: try up to 2 times (initial + 1 retry) with 2s gap
+        for attempt in range(2):
+            try:
+                session = await self._get_session()
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        return True
+                    body = await resp.text()
+                    logger.error(
+                        "Telegram send failed (attempt %d/2) status=%s body=%s | msg_preview=%s",
+                        attempt + 1, resp.status, body, text[:80].replace("\n", " "),
+                    )
+                    if attempt == 0:
+                        await asyncio.sleep(2)
+            except Exception as e:
+                logger.error(
+                    "Telegram exception (attempt %d/2) type=%s error=%s | msg_preview=%s",
+                    attempt + 1, type(e).__name__, repr(e), text[:80].replace("\n", " "),
+                )
+                if attempt == 0:
+                    await asyncio.sleep(2)
+        return False
 
     async def get_updates(self, offset: int = 0, timeout: int = 30) -> list[dict]:
         """Long-poll for incoming messages. Returns list of updates."""
@@ -137,9 +163,9 @@ class TelegramBot:
             f"\n"
             f"\U0001f9e0 <b>Confluence: {score} ({score_label})</b>"
             f"{tier_lines}\n"
-            f"\U0001f4dd <b>Reasoning:</b>\n{d.get('reasoning', '')}\n"
+            f"\U0001f4dd <b>Reasoning:</b>\n{_html_escape(d.get('reasoning', ''))}\n"
             f"\n"
-            f"\u26a0\ufe0f <b>Key Risk:</b> {d.get('primary_risk', '')}\n"
+            f"\u26a0\ufe0f <b>Key Risk:</b> {_html_escape(d.get('primary_risk', ''))}\n"
             f"\n"
             f"\u23f0 <i>Expires in {d.get('expiry_hours', 4)} hours</i>\n"
             f"\U0001f4cc Reply <b>entered</b> or <b>skip [reason]</b>"

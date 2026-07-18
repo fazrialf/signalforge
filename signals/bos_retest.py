@@ -88,6 +88,7 @@ class _SymbolState:
     retest_zone_hi:  float           = 0.0      # upper edge of FVG/OB zone
     retest_zone_lo:  float           = 0.0      # lower edge of FVG/OB zone
     zone_source:     str             = ""       # "FVG" | "OB" | "none"
+    zone_tf:         str             = "1h"     # Q-5: which TF the zone came from
 
 
 # ---------------------------------------------------------------------------
@@ -118,8 +119,18 @@ class BOSRetestWatcher:
         symbol: str,
         primary_r: SMCAnalysisResult,
         current_price: float,
+        higher_tf_r: Optional[SMCAnalysisResult] = None,
     ) -> tuple[bool, str]:
         """Evaluate BOS retest state for one symbol.
+
+        Args:
+            symbol: Asset ticker, e.g. ``'BTC/USDT'``.
+            primary_r: SMCAnalysisResult for the primary timeframe (e.g. 1h).
+            current_price: Current market price.
+            higher_tf_r: Q-5 — Optional SMCAnalysisResult for a higher TF
+                (e.g. 4h).  When provided, ``_find_retest_zone`` checks the
+                higher TF FVGs first.  A higher-TF FVG zone is a stronger
+                confluence and takes priority over the primary TF zone.
 
         Returns:
             (allow_llm: bool, reason: str)
@@ -141,7 +152,20 @@ class BOSRetestWatcher:
                 "bullish" if bos_event in (StructureEvent.BOS_BULL, StructureEvent.CHOS_BULL)
                 else "bearish"
             )
-            zone = self._find_retest_zone(primary_r, direction, close_price)
+
+            # m-2: If ARMED in the opposite direction, the structure has flipped.
+            # Reset to IDLE so we don't fire a stale bullish signal into a
+            # now-bearish market (or vice versa).
+            if s.state == RetestState.ARMED and s.bos_direction != direction:
+                logger.info(
+                    "[BOS_RETEST] %s structure flip — was ARMED %s, new BOS is %s — resetting",
+                    symbol, s.bos_direction, direction,
+                )
+                s.state = RetestState.IDLE
+            # Q-5: prefer higher-TF zone when available — stronger confluence
+            zone, zone_tf = self._find_retest_zone(
+                primary_r, direction, close_price, higher_tf_r=higher_tf_r
+            )
 
             if zone is None:
                 # No FVG/OB near the impulse — fall back to legacy immediate fire
@@ -161,13 +185,14 @@ class BOSRetestWatcher:
             s.retest_zone_hi  = zone[1]
             s.retest_zone_lo  = zone[0]
             s.zone_source     = zone[2]
+            s.zone_tf         = zone_tf   # Q-5: track which TF the zone came from
 
             logger.info(
-                "[BOS_RETEST] %s ARMED — %s %s | zone=%s %.4f–%.4f",
+                "[BOS_RETEST] %s ARMED — %s %s | zone=%s %.4f–%.4f (tf=%s)",
                 symbol, bos_event.value, direction,
-                s.zone_source, s.retest_zone_lo, s.retest_zone_hi,
+                s.zone_source, s.retest_zone_lo, s.retest_zone_hi, s.zone_tf,
             )
-            return False, f"BOS detected — waiting for retest of {s.zone_source} zone"
+            return False, f"BOS detected — waiting for retest of {s.zone_source} zone ({s.zone_tf})"
 
         # ---- 2. Handle IDLE — no pending BOS ----------------------------
         if s.state == RetestState.IDLE:
@@ -257,27 +282,44 @@ class BOSRetestWatcher:
         primary_r: SMCAnalysisResult,
         direction: str,
         impulse_close: float,
-    ) -> Optional[tuple[float, float, str]]:
+        higher_tf_r: Optional[SMCAnalysisResult] = None,
+    ) -> tuple[Optional[tuple[float, float, str]], str]:
         """Find the nearest FVG or OB left by the BOS impulse candle.
+
+        Q-5: When ``higher_tf_r`` is supplied, checks the higher TF FVGs first.
+        A higher-TF FVG is a stronger confluence zone — price respects 4H FVGs
+        far more reliably than 1H FVGs during retests.  Only falls through to
+        the primary TF when the higher TF has no qualifying zone.
 
         For a bullish BOS: look for a bullish FVG or bullish OB *below* the
         impulse close (the zone price should retrace into).
         For a bearish BOS: look for a bearish FVG or bearish OB *above* the
         impulse close.
 
-        Returns (zone_low, zone_high, source_label) or None.
+        Returns ((zone_low, zone_high, source_label), timeframe_str) or (None, "").
         """
-        # --- Try FVG first (higher probability retest zone) --------------
+        # Q-5: check higher TF FVG first — stronger institutional zone
+        if higher_tf_r is not None:
+            htf_fvg = self._best_fvg(higher_tf_r, direction, impulse_close)
+            if htf_fvg:
+                tf_label = higher_tf_r.timeframe if higher_tf_r.timeframe else "htf"
+                logger.debug(
+                    "[BOS_RETEST] Using higher-TF (%s) FVG zone %.4f–%.4f",
+                    tf_label, htf_fvg[0], htf_fvg[1],
+                )
+                return htf_fvg, tf_label
+
+        # --- Try primary TF FVG (higher probability retest zone) ----------
         fvg_zone = self._best_fvg(primary_r, direction, impulse_close)
         if fvg_zone:
-            return fvg_zone
+            return fvg_zone, primary_r.timeframe
 
-        # --- Fall back to Order Block ------------------------------------
+        # --- Fall back to Order Block on primary TF -----------------------
         ob_zone = self._best_ob(primary_r, direction, impulse_close)
         if ob_zone:
-            return ob_zone
+            return ob_zone, primary_r.timeframe
 
-        return None
+        return None, ""
 
     def _best_fvg(
         self,
@@ -373,5 +415,6 @@ class BOSRetestWatcher:
         }
 
         expected = BULL_REVERSAL if bos_direction == "bullish" else BEAR_REVERSAL
-        recent = primary_r.candlestick_patterns[:3]  # last 3 patterns only
+        # F-C2: was [:3] (first 3 — oldest patterns), must be [-3:] (last 3 — most recent)
+        recent = primary_r.candlestick_patterns[-3:]
         return any(p.pattern.lower() in expected for p in recent)
