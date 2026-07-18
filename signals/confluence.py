@@ -141,6 +141,8 @@ def score_confluence(
     mtf_aligned: bool = False,
     threshold: int = DEFAULT_THRESHOLD,
     mtf_bias: Optional[MTFBias] = None,
+    onchain: dict | None = None,
+    news_sentiment: str | None = None,
 ) -> ConfluenceScore:
     """Evaluate confluence factors from an :class:`SMCAnalysisResult`.
 
@@ -338,6 +340,43 @@ def score_confluence(
             v = lv_pullbacks[0]
             _add(factors, f"lv_pullback_{v.direction}", 3, v.direction,
                  f"Low-volume pullback ({v.direction}) RVOL={v.rvol:.2f}x")
+
+    # --- Tier 3: Funding Rate ---------------------------------------------------
+    # Extreme funding suppresses the opposite side; mild funding confirms trend.
+    if onchain:
+        fr = onchain.get("funding_rate", 0.0)
+        fr_sent = onchain.get("funding_sentiment", "neutral")  # bullish/bearish/neutral/extreme_bullish/extreme_bearish
+        if fr_sent == "extreme_bearish":  # funding very negative → longs underpriced → bullish bias
+            _add(factors, "funding_extreme_bearish", 3, "bullish", "Extreme negative funding → long squeeze exhausted")
+        elif fr_sent == "extreme_bullish":  # funding very positive → shorts underpriced → bearish bias
+            _add(factors, "funding_extreme_bullish", 3, "bearish", "Extreme positive funding → short squeeze risk")
+        elif fr_sent == "bullish" and fr > 0.0001:
+            _add(factors, "funding_bullish", 3, "bullish", f"Positive funding rate ({fr:.4%}) → bullish momentum")
+        elif fr_sent == "bearish" and fr < -0.0001:
+            _add(factors, "funding_bearish", 3, "bearish", f"Negative funding rate ({fr:.4%}) → bearish pressure")
+
+        # --- Tier 3: Open Interest Change ----------------------------------------
+        oi_chg = onchain.get("oi_change_pct", 0.0)
+        taker = onchain.get("taker_sentiment", "balanced")  # bullish/bearish/balanced
+        if oi_chg > 3.0:  # OI rising > 3% → trend confirmation
+            oi_dir = "bullish" if taker in ("bullish", "balanced") else "bearish"
+            _add(factors, "oi_rising", 3, oi_dir, f"OI +{oi_chg:.1f}% → new positions entering, trend confirmed")
+        elif oi_chg < -3.0:  # OI falling > 3% → position unwinding, caution
+            _add(factors, "oi_falling", 3, "bearish", f"OI {oi_chg:.1f}% → position unwinding, weakening trend")
+
+        # --- Tier 3: Taker Buy/Sell Ratio ----------------------------------------
+        taker_ratio = onchain.get("taker_buy_ratio", 0.5)
+        if taker_ratio > 0.60:
+            _add(factors, "taker_buy_dominant", 3, "bullish", f"Taker buy ratio {taker_ratio:.0%} → aggressive buyers")
+        elif taker_ratio < 0.40:
+            _add(factors, "taker_sell_dominant", 3, "bearish", f"Taker sell ratio {1-taker_ratio:.0%} → aggressive sellers")
+
+    # --- Tier 3: News Sentiment -------------------------------------------------
+    if news_sentiment:
+        if news_sentiment == "bullish":
+            _add(factors, "news_bullish", 3, "bullish", "Recent high-impact news is bullish for crypto")
+        elif news_sentiment == "bearish":
+            _add(factors, "news_bearish", 3, "bearish", "Recent high-impact news is bearish — caution on longs")
 
     # ==================================================================
     # Aggregate

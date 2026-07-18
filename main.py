@@ -64,7 +64,7 @@ from config.settings import (
     MAX_CONCURRENT, MAX_PORTFOLIO_HEAT_PCT,
 )
 try:
-    from external.news_fetcher import fetch_recent_news, is_high_impact_news
+    from external.news_fetcher import fetch_recent_news, is_high_impact_news, get_news_sentiment
     from external.fear_greed import fetch_fear_greed
     from external.onchain import fetch_onchain_metrics
     from external.correlations import fetch_correlations
@@ -362,6 +362,8 @@ async def main():
                     mtf_bias = check_mtf_bias(results)
                     primary_r = results.get(primary_tf)
                     if primary_r:
+                        # onchain + news_sentiment wired in after external fetch below;
+                        # initial confluence scored without them (gate decision uses raw structure)
                         confluence = score_confluence(primary_r, mtf_aligned=mtf_bias.aligned, threshold=MIN_CONFLUENCE_SCORE, mtf_bias=mtf_bias)
                         logger.info(
                             "[CONFLUENCE] %s %s | net=%d | bull=%d | bear=%d | threshold=%s",
@@ -638,6 +640,9 @@ async def main():
                                 try:
                                     news = fetch_recent_news(hours=2, keywords=['Bitcoin', 'BTC', 'Fed', 'FOMC', 'SEC', 'regulation'])
                                     external_data['news'] = [a for a in news if is_high_impact_news(a)]
+                                    # Derive sentiment string for confluence + signal formatting
+                                    external_data['news_sentiment'] = get_news_sentiment(symbol, max_age_minutes=120)
+                                    logger.info("[EXT] News sentiment for %s: %s", symbol, external_data['news_sentiment'])
                                 except Exception as e:
                                     logger.warning("[EXT] News fetch failed: %s", e)
 
@@ -654,6 +659,23 @@ async def main():
                                     strat_lines.append(f"  Reasoning: {ssig.reasoning}")
                                 strat_context = "\n".join(strat_lines)
                                 external_data['strategy_signals'] = strat_context
+
+                            # Re-score confluence with onchain + news enrichment
+                            onchain_data = external_data.get('onchain') if _EXTERNAL_AVAILABLE else None
+                            news_sent = external_data.get('news_sentiment', 'neutral') if _EXTERNAL_AVAILABLE else 'neutral'
+                            if onchain_data or news_sent != 'neutral':
+                                confluence = score_confluence(
+                                    primary_r, mtf_aligned=mtf_bias.aligned,
+                                    threshold=MIN_CONFLUENCE_SCORE, mtf_bias=mtf_bias,
+                                    onchain=onchain_data, news_sentiment=news_sent,
+                                )
+                                logger.info(
+                                    "[CONFLUENCE+EXT] %s enriched: net=%d bull=%d bear=%d funding=%s oi_chg=%.1f%% news=%s",
+                                    symbol, confluence.net_score, confluence.bullish_score, confluence.bearish_score,
+                                    onchain_data.get('funding_sentiment', 'n/a') if onchain_data else 'n/a',
+                                    onchain_data.get('oi_change_pct', 0.0) if onchain_data else 0.0,
+                                    news_sent,
+                                )
 
                             sys_prompt, usr_prompt = build_prompt(
                                 results=results,
@@ -714,15 +736,52 @@ async def main():
                                         symbol=symbol,
                                     )
                                     # Build enriched message with position sizing
-                                    msg = signal.to_telegram_message(symbol)
-                                    msg += (
-                                        f"\n\n\U0001f4cf <b>Position Sizing</b>"
-                                        f"\nRisk: {pos_size.risk_pct:.1f}% "
-                                        f"(${pos_size.risk_usd:,.0f})"
-                                        f"\nSize: {pos_size.size:.4f}"
-                                        f"\nNotional: ${pos_size.notional_usd:,.0f}"
+                                    # Build percentage offsets for TP/SL display
+                                    def _pct(target, base, direction):
+                                        if base == 0:
+                                            return 0.0
+                                        raw = (target - base) / base * 100
+                                        return raw if direction == "BUY" else -raw
+                                    _dir = signal.signal
+                                    _e = signal.entry
+                                    # Confluence factor breakdown for display
+                                    _cf_detail = {}
+                                    for f in confluence.factors:
+                                        tier_key = f"tier{f.tier}"
+                                        _cf_detail.setdefault(tier_key, [])
+                                        _cf_detail[tier_key].append(f.description)
+                                    signal_dict = {
+                                        "symbol":          symbol,
+                                        "direction":       _dir,
+                                        "entry_price":     _e,
+                                        "tp1":             signal.tp1,
+                                        "tp2":             signal.tp2,
+                                        "tp3":             signal.tp3,
+                                        "sl":              signal.stop_loss,
+                                        "tp1_pct":         _pct(signal.tp1, _e, _dir),
+                                        "tp2_pct":         _pct(signal.tp2, _e, _dir),
+                                        "tp3_pct":         _pct(signal.tp3, _e, _dir),
+                                        "sl_pct":          _pct(signal.stop_loss, _e, _dir),
+                                        "rr_ratio":        signal.rr_ratio,
+                                        "confidence":      int(signal.confidence),
+                                        "risk_pct":        pos_size.risk_pct,
+                                        "confluence_score": confluence.net_score,
+                                        "confluence_detail": _cf_detail,
+                                        "bias_tf":         "15m",
+                                        "entry_tf":        primary_tf,
+                                        "expiry_hours":    4,
+                                        "reasoning":       signal.reasoning,
+                                        "primary_risk":    signal.key_risk,
+                                        "onchain":         external_data.get('onchain', {}),
+                                        "news_sentiment":  external_data.get('news_sentiment', 'neutral'),
+                                    }
+                                    await bot.send_signal(signal_dict)
+                                    # Also send position sizing as follow-up line
+                                    await bot.send(
+                                        f"\U0001f4cf <b>Position Sizing</b>\n"
+                                        f"Risk: {pos_size.risk_pct:.1f}% (${pos_size.risk_usd:,.0f})\n"
+                                        f"Size: {pos_size.size:.4f}  |  Notional: ${pos_size.notional_usd:,.0f}"
                                     )
-                                    await bot.send(msg)
                                     # Set cooldown + track position
                                     cooldown_tracker.set_cooldown(symbol)
                                     # S-3: reset BOS retest watcher after delivery

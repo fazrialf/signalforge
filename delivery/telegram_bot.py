@@ -195,47 +195,77 @@ class TelegramBot:
             await asyncio.sleep(poll_interval)
 
     async def send_signal(self, signal: dict) -> bool:
-        """Format and send a trading signal."""
+        """Format and send a trading signal with enriched market context."""
         d = signal
-        direction_icon = "\U0001f7e2 LONG" if d["direction"] == "BUY" else "\U0001f534 SHORT"
+        is_long = d["direction"] == "BUY"
+        direction_icon = "\U0001f7e2" if is_long else "\U0001f534"  # 🟢 / 🔴
+        direction_word = "LONG" if is_long else "SHORT"
+        symbol = d["symbol"]
         score = d.get("confluence_score", 0)
-        score_label = (
-            "\U0001f3c6 Premium" if score >= 15 else
-            "Strong"            if score >= 11 else
-            "Standard"
-        )
         conf = d.get("confidence", 0)
+        rr = d.get("rr_ratio", 0)
 
-        tier_lines = ""
+        # Signal quality badge
+        if score >= 15:
+            badge = "\U0001f3c6 PREMIUM"
+        elif score >= 11:
+            badge = "\u2b50 STRONG"
+        elif score >= 8:
+            badge = "\u2705 STANDARD"
+        else:
+            badge = "\U0001f7e1 BORDERLINE"
+
+        # Confidence bar (5 blocks)
+        filled = round(conf / 20)
+        conf_bar = "\u2588" * filled + "\u2591" * (5 - filled)
+
+        # Market context block
+        onchain = d.get("onchain", {})
+        fr = onchain.get("funding_rate", 0.0)
+        oi_chg = onchain.get("oi_change_pct", 0.0)
+        ls_ratio = onchain.get("long_short_ratio", 1.0)
+        taker_ratio = onchain.get("taker_buy_ratio", 0.5)
+        news_sent = d.get("news_sentiment", "neutral")
+        news_icon = {"bullish": "\U0001f4c8", "bearish": "\U0001f4c9", "neutral": "\u27a1\ufe0f"}.get(news_sent, "\u27a1\ufe0f")
+        fr_icon = "\U0001f7e2" if fr > 0.0001 else ("\U0001f534" if fr < -0.0001 else "\u26aa")
+        oi_icon = "\u2191" if oi_chg > 1 else ("\u2193" if oi_chg < -1 else "\u2194")
+
+        # Confluence factors summary (top 5)
         detail = d.get("confluence_detail", {})
-        if detail:
-            for tier, items in detail.items():
-                tier_lines += f"\n<b>{tier}:</b>\n"
-                for item in items:
-                    tier_lines += f"  \u2705 {item}\n"
+        factor_lines = ""
+        all_factors = []
+        for tier_items in detail.values():
+            all_factors.extend(tier_items)
+        if all_factors:
+            factor_lines = "\n".join(f"  \u2022 {_html_escape(f)}" for f in all_factors[:5])
+        else:
+            factor_lines = "  \u2022 No breakdown available"
 
         text = (
-            f"\u26a1 <b>SIGNAL: {direction_icon} {d['symbol']}</b>\n"
-            f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-            f"\U0001f4cd <b>Entry:</b> ${d['entry_price']:,.2f}\n"
-            f"\U0001f3af <b>TP1:</b> ${d['tp1']:,.2f} ({d.get('tp1_pct', 0):+.1f}%) \u2014 40% close\n"
-            f"\U0001f3af <b>TP2:</b> ${d['tp2']:,.2f} ({d.get('tp2_pct', 0):+.1f}%) \u2014 30% close\n"
-            f"\U0001f3af <b>TP3:</b> ${d['tp3']:,.2f} ({d.get('tp3_pct', 0):+.1f}%) \u2014 30% close\n"
-            f"\U0001f6d1 <b>SL:</b>  ${d['sl']:,.2f} ({d.get('sl_pct', 0):+.1f}%)\n"
+            f"{direction_icon} <b>SIGNAL \u2014 {direction_word} {symbol}</b>  {badge}\n"
+            + "\u2500" * 22 + "\n"
+            + f"\n"
+            f"<b>\U0001f4cd Entry</b>   <code>${d['entry_price']:,.4f}</code>\n"
+            f"<b>\U0001f7e2 TP1</b>     <code>${d['tp1']:,.4f}</code>  <i>({d.get('tp1_pct', 0):+.2f}%)</i>  \u2192 40% out\n"
+            f"<b>\U0001f7e1 TP2</b>     <code>${d['tp2']:,.4f}</code>  <i>({d.get('tp2_pct', 0):+.2f}%)</i>  \u2192 30% out\n"
+            f"<b>\U0001f535 TP3</b>     <code>${d['tp3']:,.4f}</code>  <i>({d.get('tp3_pct', 0):+.2f}%)</i>  \u2192 30% out\n"
+            f"<b>\U0001f6d1 SL</b>      <code>${d['sl']:,.4f}</code>  <i>({d.get('sl_pct', 0):+.2f}%)</i>\n"
             f"\n"
-            f"\U0001f4ca R:R <b>{d.get('rr_ratio', 0):.1f}</b> \u2502 "
-            f"Confidence <b>{conf}%</b> \u2502 "
-            f"Risk <b>{d.get('risk_pct', 1.0):.1f}%</b>\n"
-            f"\U0001f550 Timeframe: <b>{d.get('bias_tf', '4H')} bias \u2192 {d.get('entry_tf', '1H')} entry</b>\n"
+            f"\U0001f4ca <b>R:R</b> {rr:.2f}  \u2502  <b>Conf</b> {conf}% [{conf_bar}]  \u2502  <b>Risk</b> {d.get('risk_pct', 1.0):.1f}%\n"
+            f"\U0001f552 <b>TF:</b> {d.get('bias_tf', '15m')} bias \u2192 {d.get('entry_tf', '5m')} entry\n"
             f"\n"
-            f"\U0001f9e0 <b>Confluence: {score} ({score_label})</b>"
-            f"{tier_lines}\n"
-            f"\U0001f4dd <b>Reasoning:</b>\n{_html_escape(d.get('reasoning', ''))}\n"
+            f"\U0001f30a <b>Market Context</b>\n"
+            f"  {fr_icon} Funding: <code>{fr:+.4%}</code>   {oi_icon} OI: <code>{oi_chg:+.1f}%</code>\n"
+            f"  \U0001f465 L/S: <code>{ls_ratio:.2f}</code>   \U0001f3b2 Taker Buy: <code>{taker_ratio:.0%}</code>\n"
+            f"  {news_icon} News: <b>{news_sent.capitalize()}</b>\n"
+            f"\n"
+            f"\U0001f9e0 <b>Confluence {score} \u2014 {badge}</b>\n"
+            f"{factor_lines}\n"
+            f"\n"
+            f"\U0001f4dd <b>Analysis:</b>\n<i>{_html_escape(d.get('reasoning', ''))}</i>\n"
             f"\n"
             f"\u26a0\ufe0f <b>Key Risk:</b> {_html_escape(d.get('primary_risk', ''))}\n"
-            f"\n"
-            f"\u23f0 <i>Expires in {d.get('expiry_hours', 4)} hours</i>\n"
-            f"\U0001f4cc Reply <b>entered</b> or <b>skip [reason]</b>"
+            f"\u23f0 <i>Valid {d.get('expiry_hours', 4)}h</i>  \u2502  \U0001f4cc Reply <b>entered</b> / <b>skip</b>"
         )
         return await self.send(text)
 

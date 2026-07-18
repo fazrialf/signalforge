@@ -255,3 +255,62 @@ def is_high_impact_news(article: dict) -> bool:
     """
     text = f"{article.get('title', '')} {article.get('summary', '')}".lower()
     return any(keyword in text for keyword in HIGH_IMPACT_KEYWORDS)
+
+
+def get_recent_articles(max_age_minutes: int = 60, keywords: Optional[list[str]] = None) -> list[dict]:
+    """Thin adapter over fetch_recent_news() using a minutes-based window.
+
+    Args:
+        max_age_minutes: Look back this many minutes from now.
+        keywords: Optional keyword filter list passed through to fetch_recent_news.
+
+    Returns:
+        List of article dicts, same schema as fetch_recent_news().
+    """
+    hours = max_age_minutes / 60.0
+    return fetch_recent_news(hours=hours, keywords=keywords)
+
+
+def get_news_sentiment(symbol: str | None = None, max_age_minutes: int = 60) -> str:
+    """Derive an overall sentiment string from recent high-impact news.
+
+    Returns 'bullish', 'bearish', or 'neutral'.
+    Looks at articles published in the last max_age_minutes.
+    If symbol is given (e.g. 'BTC'), also match symbol-specific articles.
+    """
+    try:
+        keywords = [symbol.replace("/USDT", "").replace("/", "").lower()] if symbol else None
+        articles = get_recent_articles(max_age_minutes=max_age_minutes, keywords=keywords)
+        if not articles:
+            # Fallback: check general crypto news for high-impact items
+            articles = get_recent_articles(max_age_minutes=max_age_minutes)
+
+        bullish_keywords = [
+            "rally", "surge", "breakout", "etf approved", "etf inflow",
+            "adoption", "upgrade", "partnership", "bullish", "all-time high",
+            "ath", "institutional", "buy", "accumulate", "positive"
+        ]
+        bearish_keywords = [
+            "crash", "dump", "ban", "hack", "exploit", "lawsuit", "sec",
+            "regulation", "bearish", "sell-off", "liquidation", "fear",
+            "inflation", "rate hike", "fomc", "cpi miss", "collapse"
+        ]
+
+        bull_score = 0
+        bear_score = 0
+        for article in articles[:10]:  # only most recent 10
+            text = f"{article.get('title', '')} {article.get('summary', '')}".lower()
+            weight = 2 if is_high_impact_news(article) else 1
+            bull_score += weight * sum(1 for kw in bullish_keywords if kw in text)
+            bear_score += weight * sum(1 for kw in bearish_keywords if kw in text)
+
+        if bull_score == 0 and bear_score == 0:
+            return "neutral"
+        if bull_score > bear_score * 1.5:
+            return "bullish"
+        if bear_score > bull_score * 1.5:
+            return "bearish"
+        return "neutral"
+    except Exception as e:
+        logger.warning("get_news_sentiment error: %s", e)
+        return "neutral"
