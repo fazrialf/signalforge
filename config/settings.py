@@ -8,7 +8,22 @@ load_dotenv(BASE_DIR / "config" / ".env")
 
 # --- TELEGRAM
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+# Primary chat (DM) — used for command auth default + backward-compatible single target
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+# Optional extra destinations for dual/multi delivery (comma-separated).
+# Example: TELEGRAM_EXTRA_CHAT_IDS=-1003811405386
+# All outbound signals/alerts fan out to TELEGRAM_CHAT_ID + these extras.
+# Command replies stay in the chat that sent the command.
+_EXTRA_RAW = os.environ.get("TELEGRAM_EXTRA_CHAT_IDS", "")
+TELEGRAM_EXTRA_CHAT_IDS = [c.strip() for c in _EXTRA_RAW.split(",") if c.strip()]
+# Deduped ordered list: primary first, then extras
+_seen_chat_ids: set[str] = set()
+TELEGRAM_CHAT_IDS: list[str] = []
+for _cid in [TELEGRAM_CHAT_ID, *TELEGRAM_EXTRA_CHAT_IDS]:
+    if _cid and _cid not in _seen_chat_ids:
+        TELEGRAM_CHAT_IDS.append(_cid)
+        _seen_chat_ids.add(_cid)
+del _seen_chat_ids
 
 # --- LLM
 OPENAI_API_KEY     = os.environ.get("OPENAI_API_KEY", "")

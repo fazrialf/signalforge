@@ -26,11 +26,31 @@ def _html_escape(text: str) -> str:
 
 
 class TelegramBot:
-    def __init__(self, token: str, chat_id: str):
-        self.token   = token
-        self.chat_id = chat_id
-        self.base    = f"https://api.telegram.org/bot{token}"
+    def __init__(self, token: str, chat_id: str | list[str]):
+        """
+        token: Telegram bot token
+        chat_id: primary chat id (str) OR list of chat ids for dual/multi delivery.
+                 First entry is primary (backward-compatible self.chat_id).
+        """
+        self.token = token
+        if isinstance(chat_id, (list, tuple, set)):
+            seen: set[str] = set()
+            self.chat_ids: list[str] = []
+            for c in chat_id:
+                s = str(c).strip()
+                if s and s not in seen:
+                    self.chat_ids.append(s)
+                    seen.add(s)
+        else:
+            self.chat_ids = [str(chat_id).strip()] if str(chat_id).strip() else []
+        # Primary chat — used by ErrorAlerter and any single-chat callers
+        self.chat_id = self.chat_ids[0] if self.chat_ids else ""
+        self.base = f"https://api.telegram.org/bot{token}"
         self._session: aiohttp.ClientSession | None = None
+        logger.info(
+            "[Telegram] delivery targets=%s (primary=%s)",
+            self.chat_ids, self.chat_id,
+        )
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Return the persistent session, creating it if necessary."""
@@ -44,36 +64,76 @@ class TelegramBot:
             await self._session.close()
             self._session = None
 
-    async def send(self, text: str, parse_mode: str = "HTML") -> bool:
-        """Send a message with 1x retry on failure. Returns True on success."""
-        url     = f"{self.base}/sendMessage"
+    async def _send_one(
+        self, chat_id: str, text: str, parse_mode: str = "HTML"
+    ) -> bool:
+        """Send to a single chat_id with 1x retry. Returns True on success."""
+        url = f"{self.base}/sendMessage"
         payload = {
-            "chat_id":    self.chat_id,
-            "text":       text,
+            "chat_id": chat_id,
+            "text": text,
             "parse_mode": parse_mode,
         }
         # L-2: try up to 2 times (initial + 1 retry) with 2s gap
         for attempt in range(2):
             try:
                 session = await self._get_session()
-                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                async with session.post(
+                    url, json=payload, timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
                     if resp.status == 200:
                         return True
                     body = await resp.text()
                     logger.error(
-                        "Telegram send failed (attempt %d/2) status=%s body=%s | msg_preview=%s",
-                        attempt + 1, resp.status, body, text[:80].replace("\n", " "),
+                        "Telegram send failed chat=%s (attempt %d/2) status=%s body=%s | msg_preview=%s",
+                        chat_id, attempt + 1, resp.status, body,
+                        text[:80].replace("\n", " "),
                     )
                     if attempt == 0:
                         await asyncio.sleep(2)
             except Exception as e:
                 logger.error(
-                    "Telegram exception (attempt %d/2) type=%s error=%s | msg_preview=%s",
-                    attempt + 1, type(e).__name__, repr(e), text[:80].replace("\n", " "),
+                    "Telegram exception chat=%s (attempt %d/2) type=%s error=%s | msg_preview=%s",
+                    chat_id, attempt + 1, type(e).__name__, repr(e),
+                    text[:80].replace("\n", " "),
                 )
                 if attempt == 0:
                     await asyncio.sleep(2)
         return False
+
+    async def send(
+        self,
+        text: str,
+        parse_mode: str = "HTML",
+        chat_id: str | None = None,
+    ) -> bool:
+        """
+        Send a message.
+
+        - chat_id set  → single-target (command replies stay in that chat)
+        - chat_id None → fan-out to ALL configured chats (signals/alerts)
+
+        Returns True if at least one destination accepted the message.
+        """
+        if chat_id is not None:
+            targets = [str(chat_id)]
+        else:
+            targets = list(self.chat_ids)
+
+        if not targets:
+            logger.error("Telegram send aborted — no chat_id configured")
+            return False
+
+        results = await asyncio.gather(
+            *[self._send_one(cid, text, parse_mode) for cid in targets]
+        )
+        ok = any(results)
+        if ok and len(targets) > 1:
+            logger.info(
+                "Telegram fan-out: %d/%d targets ok | targets=%s",
+                sum(1 for r in results if r), len(targets), targets,
+            )
+        return ok
 
     async def get_updates(self, offset: int = 0, timeout: int = 30) -> list[dict]:
         """Long-poll for incoming messages. Returns list of updates."""
@@ -81,7 +141,9 @@ class TelegramBot:
         params = {"offset": offset, "timeout": timeout, "allowed_updates": ["message"]}
         try:
             session = await self._get_session()
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=timeout + 5)) as resp:
+            async with session.get(
+                url, params=params, timeout=aiohttp.ClientTimeout(total=timeout + 5)
+            ) as resp:
                 if resp.status != 200:
                     return []
                 data = await resp.json()
@@ -94,11 +156,15 @@ class TelegramBot:
         """
         Long-poll Telegram for incoming commands and dispatch them.
 
-        Runs forever. Pass a TelegramCommandHandler-like object with
-        an async handle_command(command, args) -> str method.
+        Accepts commands from ANY configured chat (DM or group).
+        Command replies are sent only to the originating chat (not fan-out).
         """
         last_update_id = 0
-        logger.info("[POLL] Starting Telegram command polling...")
+        allowed = set(self.chat_ids)
+        logger.info(
+            "[POLL] Starting Telegram command polling (allowed chats=%s)...",
+            sorted(allowed),
+        )
         while True:
             try:
                 updates = await self.get_updates(offset=last_update_id + 1, timeout=30)
@@ -107,8 +173,8 @@ class TelegramBot:
                         continue
                     msg = update["message"]
                     chat_id = str(msg.get("chat", {}).get("id", ""))
-                    # Only respond to our configured chat
-                    if chat_id != self.chat_id:
+                    # Only accept commands from configured chats
+                    if chat_id not in allowed:
                         continue
                     text = msg.get("text", "").strip()
                     if not text.startswith("/"):
@@ -117,7 +183,8 @@ class TelegramBot:
                     command = parts[0].lstrip("/").split("@")[0].lower()
                     args = parts[1:]
                     result = await cmd_handler.handle_command(command, args)
-                    await self.send(result)
+                    # Reply only to the chat that issued the command
+                    await self.send(result, chat_id=chat_id)
                     last_update_id = update["update_id"]
             except asyncio.CancelledError:
                 logger.info("[POLL] Polling cancelled.")

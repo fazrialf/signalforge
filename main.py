@@ -17,7 +17,7 @@ ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
 from config.settings import (
-    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_CHAT_IDS,
     TIMEFRAMES, HISTORY_BARS,
     WATCHDOG_INTERVAL, WS_STALE_SECONDS, DAILY_PING_HOUR_UTC,
     STATUS_PATH, LOG_PATH, DB_PATH
@@ -99,7 +99,7 @@ async def main():
 
     # 2. Init Telegram bot
     logger.info("[2/5] Connecting Telegram bot...")
-    bot = TelegramBot(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+    bot = TelegramBot(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_IDS or TELEGRAM_CHAT_ID)
     await bot.send(
         "\U0001f7e2 <b>SignalForge is starting up!</b>\n"
         "Loading historical data from Binance..."
