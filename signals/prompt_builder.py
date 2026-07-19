@@ -198,6 +198,20 @@ def build_prompt(
         sections.append(f"- {tf_label}: {val}")
     sections.append(f"- Strength: {mtf_bias.strength:.0%}")
 
+    # HTF context — daily trend awareness for counter-trend scalp filtering
+    daily_val = getattr(mtf_bias.daily_bias, 'value', str(mtf_bias.daily_bias)) if mtf_bias.daily_bias else 'UNKNOWN'
+    h4_val    = getattr(mtf_bias.h4_bias,    'value', str(mtf_bias.h4_bias))    if mtf_bias.h4_bias    else 'UNKNOWN'
+    sections.append(
+        f"\n## Higher-Timeframe Context (Macro Bias)\n"
+        f"- Daily (1D) trend: {daily_val}\n"
+        f"- 4H trend: {h4_val}\n"
+        f"⚠️ NOTE: This is a 5m SCALP system. The daily/4H bias is CONTEXT only — "
+        f"not a hard filter. A clean 5m BOS+FVG retest against the daily trend is "
+        f"still valid if the 4H and 1H structure supports the entry. "
+        f"Counter-trend scalps require tighter SL and lower confidence. "
+        f"With-trend scalps (5m aligned with 4H+1H) warrant higher confidence."
+    )
+
     # 4. OHLCV table for primary TF
     if candle_df is not None and len(candle_df) > 0:
         sections.append(f"\n## Last 10 Candles ({primary_tf.upper()})")

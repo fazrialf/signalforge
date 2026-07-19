@@ -159,7 +159,7 @@ def _fetch_feed(url: str, source_name: str) -> list[dict]:
     return articles
 
 
-def fetch_recent_news(hours: int = 2, keywords: Optional[list[str]] = None) -> list[dict]:
+def fetch_recent_news(hours: int = 24, keywords: Optional[list[str]] = None) -> list[dict]:
     """Fetch crypto news from CoinDesk + CoinTelegraph RSS feeds.
     
     Args:
@@ -257,7 +257,7 @@ def is_high_impact_news(article: dict) -> bool:
     return any(keyword in text for keyword in HIGH_IMPACT_KEYWORDS)
 
 
-def get_recent_articles(max_age_minutes: int = 60, keywords: Optional[list[str]] = None) -> list[dict]:
+def get_recent_articles(max_age_minutes: int = 1440, keywords: Optional[list[str]] = None) -> list[dict]:
     """Thin adapter over fetch_recent_news() using a minutes-based window.
 
     Args:
@@ -271,7 +271,7 @@ def get_recent_articles(max_age_minutes: int = 60, keywords: Optional[list[str]]
     return fetch_recent_news(hours=hours, keywords=keywords)
 
 
-def get_news_sentiment(symbol: str | None = None, max_age_minutes: int = 60) -> str:
+def get_news_sentiment(symbol: str | None = None, max_age_minutes: int = 1440) -> str:
     """Derive an overall sentiment string from recent high-impact news.
 
     Returns 'bullish', 'bearish', or 'neutral'.
