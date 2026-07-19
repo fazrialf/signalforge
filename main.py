@@ -97,6 +97,14 @@ async def main():
     # 1. Init DB
     logger.info("[1/5] Initialising database...")
     init_db()
+    # Fix 8: Checkpoint WAL on startup so DB is readable from external tools
+    try:
+        import sqlite3 as _sqlite3
+        with _sqlite3.connect(DB_PATH) as _conn:
+            _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        logger.info("[DB] WAL checkpoint complete")
+    except Exception as _wal_exc:
+        logger.warning("[DB] WAL checkpoint failed (non-critical): %s", _wal_exc)
 
     # 2. Init Telegram bot
     logger.info("[2/5] Connecting Telegram bot...")
@@ -651,10 +659,10 @@ async def main():
                                 except Exception as e:
                                     logger.warning("[EXT] Correlations fetch failed: %s", e)
                                 try:
-                                    news = fetch_recent_news(hours=2, keywords=['Bitcoin', 'BTC', 'Fed', 'FOMC', 'SEC', 'regulation'])
+                                    news = fetch_recent_news(hours=24, keywords=['Bitcoin', 'BTC', 'Fed', 'FOMC', 'SEC', 'regulation'])
                                     external_data['news'] = [a for a in news if is_high_impact_news(a)]
                                     # Derive sentiment string for confluence + signal formatting
-                                    external_data['news_sentiment'] = get_news_sentiment(symbol, max_age_minutes=120)
+                                    external_data['news_sentiment'] = get_news_sentiment(symbol, max_age_minutes=1440)
                                     logger.info("[EXT] News sentiment for %s: %s", symbol, external_data['news_sentiment'])
                                 except Exception as e:
                                     logger.warning("[EXT] News fetch failed: %s", e)
