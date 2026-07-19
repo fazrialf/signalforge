@@ -89,6 +89,11 @@ class _SymbolState:
     retest_zone_lo:  float           = 0.0      # lower edge of FVG/OB zone
     zone_source:     str             = ""       # "FVG" | "OB" | "none"
     zone_tf:         str             = "1h"     # Q-5: which TF the zone came from
+    # FIX: memory of already-triggered BOS levels — prevents re-arming on the
+    # same level after TRIGGERED resets state to IDLE.  Stored as a set of
+    # broke_level floats; cleared when a meaningfully different BOS arrives
+    # (>0.5% away from every stored level).
+    triggered_levels: "set[float]"  = field(default_factory=set)
 
 
 # ---------------------------------------------------------------------------
@@ -229,11 +234,13 @@ class BOSRetestWatcher:
                         f"(bar {s.bar_count}/{BOS_RETEST_TTL_BARS})"
                     )
 
-            # Retest confirmed — trigger LLM, then reset
+            # Retest confirmed — record this level so we never re-arm on it,
+            # then reset to IDLE and allow the LLM to fire this cycle.
             logger.info(
                 "[BOS_RETEST] %s TRIGGERED — price %.4f tapped %s zone | bars_waited=%d",
                 symbol, current_price, s.zone_source, s.bar_count,
             )
+            s.triggered_levels.add(s.bos_level)  # FIX: remember this level
             s.state = RetestState.IDLE  # reset immediately after trigger
             return True, f"retest triggered on {s.zone_source} zone after {s.bar_count} bars"
 
@@ -267,13 +274,38 @@ class BOSRetestWatcher:
         if latest is None:
             return None
 
-        # Avoid re-arming on the same BOS level we're already watching
+        # Avoid re-arming on the same BOS level we're already watching (ARMED guard)
         already_armed_on_this_level = (
             s.state == RetestState.ARMED and
             abs(latest.broke_level - s.bos_level) < s.bos_level * 0.001
         )
         if already_armed_on_this_level:
             return None
+
+        # FIX: avoid re-arming on any level we already triggered on this session.
+        # This prevents the IDLE→ARMED→TRIGGERED→IDLE→ARMED loop on the same FVG.
+        # Clear stale triggered levels when a genuinely new BOS arrives (>0.5% away).
+        threshold = latest.broke_level * 0.005  # 0.5%
+        already_triggered = any(
+            abs(latest.broke_level - lvl) < threshold
+            for lvl in s.triggered_levels
+        )
+        if already_triggered:
+            logger.debug(
+                "[BOS_RETEST] %s skipping re-arm — broke_level %.4f already triggered",
+                "?", latest.broke_level,
+            )
+            return None
+
+        # New BOS at a meaningfully different level — clear stale triggered memory
+        # so old levels don't block forever when price revisits a zone much later.
+        if s.triggered_levels:
+            all_stale = all(
+                abs(latest.broke_level - lvl) > latest.broke_level * 0.02  # 2% away = new zone
+                for lvl in s.triggered_levels
+            )
+            if all_stale:
+                s.triggered_levels.clear()
 
         return (latest.event, latest.broke_level, latest.close_price)
 

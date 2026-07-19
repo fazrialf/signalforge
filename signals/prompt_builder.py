@@ -24,7 +24,7 @@ SCALPING CONTEXT:
 - If the 5m structure is clean (BOS + FVG retest + reversal candle) but 1H is neutral, that is VALID for a scalp.
 - Tight stops are expected: SL should be at the nearest 5m structure level (FVG edge, OB boundary, swing low/high).
 - TP1 targets the next 5m liquidity pool or swing point; TP2/TP3 extend to 15m levels.
-- R:R minimum is 1.8 — entries with R:R below this are negative EV after fees (0.2% round-trip).
+- R:R minimum is 1.2 — entries with R:R below this are negative EV after fees (0.2% round-trip). R:R is evaluated across all three TP levels, so tight TP1 is acceptable if TP2/TP3 extend the reward meaningfully.
 - Be decisive: if confluence is strong on 5m, don't let neutral 1H bias reduce confidence excessively.
 - Confidence should reflect the 5m setup quality, not macro uncertainty.
 
@@ -44,13 +44,13 @@ Required JSON schema (all fields mandatory, no exceptions):
   "reasoning": "<string — explain your analysis and decision, minimum 20 words>",
   "key_risk": "<string — describe the main risk or reason for PASS, minimum 10 words>",
   "timeframe": "<string — recommended hold timeframe e.g. '5m', '15m', '1h'>",
-  "rr_ratio": <float — abs(tp1-entry)/abs(entry-stop_loss), 0.0 for PASS>
+  "rr_ratio": <float — blended R:R across TP1/TP2/TP3 (weights 30/40/30): sum(abs(tpN-entry)/abs(entry-stop_loss) * weightN), 0.0 for PASS>
 }
 
 Rules for BUY/SELL signals:
 - stop_loss MUST be a real structural level (swing low/high, OB boundary, FVG edge) — never arbitrary.
 - tp1/tp2/tp3 MUST align with the next S/R levels, FVG boundaries, or swing highs/lows.
-- rr_ratio MUST be calculated: abs(tp1 - entry) / abs(entry - stop_loss).
+- rr_ratio MUST be calculated as blended across all three TPs: (abs(tp1-entry)*0.3 + abs(tp2-entry)*0.4 + abs(tp3-entry)*0.3) / abs(entry-stop_loss).
 - confidence reflects your conviction 0-100 — be decisive on clean 5m setups, not overly conservative.
 
 Rules for PASS signal:
@@ -223,11 +223,23 @@ def build_prompt(
             sections.append(f"\n## Chart Patterns\n" + "\n".join(f"- {s}" for s in chp_strs))
 
     # 7. Confluence score breakdown
-    sections.append(f"\n## Confluence Score\nDirection: {confluence.direction.upper()}")
-    sections.append(f"Net Score: {confluence.net_score} (Bullish={confluence.bullish_score}, Bearish={confluence.bearish_score})")
-    sections.append(f"Meets Threshold (≥{MIN_CONFLUENCE_SCORE}): {'YES' if confluence.meets_threshold else 'NO'}")
+    # FIX: inject the pre-computed verdict explicitly so the LLM does NOT
+    # re-evaluate or re-score confluence.  The LLM's job is entry quality
+    # and R:R — not to recount factors or second-guess the threshold gate.
+    threshold_verdict = "✅ PASSED" if confluence.meets_threshold else "❌ NOT MET"
+    sections.append(
+        f"\n## Confluence Score — PRE-COMPUTED (DO NOT RE-EVALUATE)\n"
+        f"Direction: {confluence.direction.upper()}\n"
+        f"Net Score: {confluence.net_score} "
+        f"(Bullish={confluence.bullish_score}, Bearish={confluence.bearish_score})\n"
+        f"Threshold (≥{MIN_CONFLUENCE_SCORE}): {threshold_verdict}\n"
+        f"⚠️ IMPORTANT: This confluence score was computed by the scoring engine and has "
+        f"already {'PASSED' if confluence.meets_threshold else 'FAILED'} the threshold gate. "
+        f"Do NOT recount factors or re-apply the threshold yourself. "
+        f"Your task is to evaluate ENTRY QUALITY, TIMING, and R:R only."
+    )
     if confluence.factors:
-        sections.append("\nFactors:")
+        sections.append("\nFactors (for context only — score is final):")
         for f in sorted(confluence.factors, key=lambda x: -x.weight):
             sections.append(f"  [{f.direction.upper():7s} T{f.tier} +{f.weight}] {f.name}: {f.description}")
 
