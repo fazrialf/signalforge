@@ -163,20 +163,35 @@ def _parse_llm_response(raw: str, model: str, latency_ms: int) -> SignalResult:
     missing = _REQUIRED_KEYS - set(data.keys())
     if missing:
         logger.warning(f"[LLM] Missing keys in response: {missing}")
-        # Compute rr_ratio from entry/stop_loss/tp1 if available
+        # Compute rr_ratio from entry/stop_loss/tp1/tp2/tp3 if available.
+        # Uses a blended weighted average across all three TP levels (30/40/30)
+        # to reflect the full trade plan — TP1-only R:R systematically
+        # undervalues multi-TP scalping setups and causes false filter blocks.
         if "rr_ratio" in missing:
             try:
                 entry = float(data.get("entry", 0))
                 sl = float(data.get("stop_loss", 0))
                 tp1 = float(data.get("tp1", 0))
-                if entry and sl and tp1 and entry != sl:
+                tp2 = float(data.get("tp2", 0))
+                tp3 = float(data.get("tp3", 0))
+                if entry and sl and entry != sl:
                     sig = str(data.get("signal", "BUY")).upper()
-                    if sig == "BUY":
-                        data["rr_ratio"] = (tp1 - entry) / (entry - sl)
-                    else:
-                        data["rr_ratio"] = (entry - tp1) / (entry - sl) if entry != sl else 0.0
+                    risk = abs(entry - sl)
+                    # Collect valid TP levels and their weights (30/40/30)
+                    tp_levels = [(tp1, 0.3), (tp2, 0.4), (tp3, 0.3)]
+                    valid = [(tp, w) for tp, w in tp_levels if tp and tp != entry]
+                    if valid:
+                        total_w = sum(w for _, w in valid)
+                        if sig == "BUY":
+                            blended = sum(((tp - entry) / risk) * (w / total_w) for tp, w in valid)
+                        else:
+                            blended = sum(((entry - tp) / risk) * (w / total_w) for tp, w in valid)
+                        data["rr_ratio"] = max(blended, 0.0)
+                        logger.info(
+                            "[LLM] rr_ratio computed from blended TP1/TP2/TP3 "
+                            "(weights 30/40/30): %.2f", data["rr_ratio"]
+                        )
                     missing.discard("rr_ratio")
-                    logger.info("[LLM] rr_ratio computed from entry/sl/tp1")
             except Exception:
                 data["rr_ratio"] = 0.0
                 missing.discard("rr_ratio")
@@ -232,12 +247,42 @@ def _parse_llm_response(raw: str, model: str, latency_ms: int) -> SignalResult:
 
         # Recompute R:R from price levels whenever prices are available.
         # Always recompute — LLM-provided rr_ratio is unreliable (wrong sign,
-        # wrong formula, or zero). R:R is always a positive ratio: reward / risk.
-        if entry and sl and tp1 and entry != sl:
-            reward = abs(tp1 - entry)
-            risk   = abs(entry - sl)
-            llm_rr = reward / risk if risk > 0 else 0.0
-            logger.info("[LLM] rr_ratio recomputed from prices: %.2f", llm_rr)
+        # wrong formula, or zero). Uses blended TP1/TP2/TP3 (weights 30/40/30)
+        # to reflect the full multi-TP trade plan, not just the TP1 distance.
+        tp2 = _f(data.get("tp2"), 0)
+        tp3 = _f(data.get("tp3"), 0)
+        if entry and sl and entry != sl:
+            risk = abs(entry - sl)
+            tp_levels = [(tp1, 0.3), (tp2, 0.4), (tp3, 0.3)]
+            valid = [(tp, w) for tp, w in tp_levels if tp and tp != entry]
+            if valid:
+                total_w = sum(w for _, w in valid)
+                llm_rr = max(
+                    sum((abs(tp - entry) / risk) * (w / total_w) for tp, w in valid),
+                    0.0
+                )
+                logger.info("[LLM] rr_ratio recomputed from blended TP1/TP2/TP3 (30/40/30): %.2f", llm_rr)
+
+            # Fix 2: If R:R is still below minimum after recompute, rebuild TP levels
+            # from entry+SL to guarantee MIN_RR_RATIO. Only applies to BUY/SELL, not PASS.
+            from config.settings import MIN_RR_RATIO as _MIN_RR
+            if sig in ("BUY", "SELL") and llm_rr < _MIN_RR:
+                old_rr = llm_rr
+                multiplier = 1.0 if _MIN_RR <= 1.0 else _MIN_RR
+                if sig == "BUY":
+                    tp1 = entry + risk * multiplier * 0.8   # TP1 at 0.8R
+                    tp2 = entry + risk * multiplier * 1.3   # TP2 at 1.3R
+                    tp3 = entry + risk * multiplier * 1.8   # TP3 at 1.8R
+                else:
+                    tp1 = entry - risk * multiplier * 0.8
+                    tp2 = entry - risk * multiplier * 1.3
+                    tp3 = entry - risk * multiplier * 1.8
+                # Recompute blended R:R with new TPs
+                llm_rr = (abs(tp1 - entry) * 0.3 + abs(tp2 - entry) * 0.4 + abs(tp3 - entry) * 0.3) / risk
+                logger.info(
+                    "[LLM] R:R %.2f below minimum %.2f — TPs rebuilt: TP1=%.4f TP2=%.4f TP3=%.4f → R:R=%.2f",
+                    old_rr, _MIN_RR, tp1, tp2, tp3, llm_rr
+                )
 
         return SignalResult(
             signal=signal,
@@ -245,8 +290,8 @@ def _parse_llm_response(raw: str, model: str, latency_ms: int) -> SignalResult:
             entry=entry,
             stop_loss=sl,
             tp1=tp1,
-            tp2=_f(data.get("tp2"), 0),
-            tp3=_f(data.get("tp3"), 0),
+            tp2=tp2,   # use local var — may have been rebuilt by TP-rebuild path
+            tp3=tp3,   # use local var — may have been rebuilt by TP-rebuild path
             reasoning=str(data.get("reasoning") or ""),
             key_risk=str(data.get("key_risk") or ""),
             timeframe=str(data.get("timeframe") or "1h"),
