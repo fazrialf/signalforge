@@ -58,7 +58,7 @@ class AssetConfig:
     min_confluence_score: int = 8
     """Minimum net confluence score required before calling the LLM."""
 
-    min_rr: float = 1.5
+    min_rr: float = 1.0
     """Minimum risk-to-reward ratio accepted by the filter gate."""
 
     # ------------------------------------------------------------------ #
@@ -174,7 +174,7 @@ ASSETS: list[AssetConfig] = [
         lookback_bars=300,
         cooldown_minutes=10,
         min_confluence_score=5,
-        min_rr=1.8,
+        min_rr=1.0,
         description="Hyperliquid (scalping)",
         enabled=True,
         use_futures=True,
@@ -187,7 +187,7 @@ ASSETS: list[AssetConfig] = [
         lookback_bars=300,
         cooldown_minutes=10,
         min_confluence_score=5,
-        min_rr=1.8,
+        min_rr=1.0,
         description="Sui (scalping)",
         enabled=True,
     ),

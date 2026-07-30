@@ -54,7 +54,7 @@ HISTORY_BARS = 500
 # don't require a code deploy — just change .env and restart.
 MIN_CONFLUENCE_SCORE = int(float(os.environ.get("MIN_CONFLUENCE_SCORE", "6")))
 MIN_LLM_CONFIDENCE   = float(os.environ.get("MIN_LLM_CONFIDENCE",   "65"))
-MIN_RR_RATIO         = float(os.environ.get("MIN_RR_RATIO",          "1.8"))  # 1.2 barely covers 0.2% round-trip fees
+MIN_RR_RATIO         = float(os.environ.get("MIN_RR_RATIO",          "1.0"))  # 1.0 minimum for scalping; override per-asset via AssetConfig.min_rr
 TIER1_WEIGHT = 3
 TIER2_WEIGHT = 2
 TIER3_WEIGHT = 1
@@ -123,8 +123,8 @@ MTF_STRENGTH_MIN_SCALP  = 0.33
 # BOS_RETEST_OB_TOLERANCE         — max % distance from impulse close to accept OB
 # BOS_RETEST_REQUIRE_REVERSAL_CANDLE — require a reversal candle at the zone before firing
 BOS_RETEST_ENABLED                 = True
-BOS_RETEST_TTL_BARS                = 12      # ~12 minutes at 1 cycle/min (scalping: tighter window)
-BOS_RETEST_FVG_TOLERANCE           = 0.01    # 1% from impulse close (scalping: tighter zones)
+BOS_RETEST_TTL_BARS                = 20      # ~20 minutes at 1 cycle/min (was 12 — too tight for 5m pullbacks)
+BOS_RETEST_FVG_TOLERANCE           = 0.015   # 1.5% from impulse close (was 1% — too tight for volatile alts)
 BOS_RETEST_OB_TOLERANCE            = 0.02    # 2% from impulse close (scalping: tighter zones)
 BOS_RETEST_REQUIRE_REVERSAL_CANDLE = True    # require hammer/engulfing etc at zone
 
@@ -149,10 +149,12 @@ ATR_MIN_BARS          = 40   # ATR_PERIOD + ATR_AVG_PERIOD + headroom
 # --- SESSION FILTER
 # Alt coins only — BTC/ETH trade 24/7. Alts blocked outside London/NY open.
 # London: 07:00–16:00 UTC. NY: 13:00–22:00 UTC. Overlap: 13:00–16:00 UTC.
-# Combined active window: 07:00–22:00 UTC. TIER1 assets bypass session filter.
-SESSION_FILTER_ENABLED = True
-SESSION_ACTIVE_START_UTC = 7   # 07:00 UTC (London open)
-SESSION_ACTIVE_END_UTC   = 22  # 22:00 UTC (NY close)
+# Crypto trades 24/7 — no session restriction needed.
+# All assets including alts are active around the clock.
+# TIER1 assets bypass session filter regardless.
+SESSION_FILTER_ENABLED   = False  # disabled — crypto is 24/7
+SESSION_ACTIVE_START_UTC = 0   # 00:00 UTC (full 24h window)
+SESSION_ACTIVE_END_UTC   = 23  # 23:00 UTC (full 24h window)
 TIER1_ASSETS = ["BTC/USDT", "ETH/USDT"]  # always allowed, no session restriction
 
 # --- HEALTH

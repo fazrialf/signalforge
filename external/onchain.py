@@ -238,9 +238,29 @@ def _fetch_open_interest(symbol: str) -> tuple[float, float]:
     # OI is returned as a string in the base asset (BTC), not USD
     # We'll return it as-is for now; converting to USD would require price data
     open_interest: float = float(data["openInterest"])
-    oi_change_pct: float = 0.0  # Placeholder for future implementation
 
-    logger.debug("Fetched open interest: %.2f", open_interest)
+    # Fix 4: Compute real OI delta vs 1h ago using Binance OI history endpoint.
+    # Uses /fapi/v1/openInterestHist — public, no API key required.
+    oi_change_pct: float = 0.0
+    try:
+        hist_url = f"{BASE_URL}/futures/data/openInterestHist"
+        hist_params = {"symbol": symbol, "period": "1h", "limit": 2}
+        hist_resp = requests.get(hist_url, params=hist_params, timeout=_REQUEST_TIMEOUT)
+        hist_resp.raise_for_status()
+        hist_data = hist_resp.json()
+        if len(hist_data) >= 2:
+            oi_prev = float(hist_data[0]["sumOpenInterest"])
+            oi_curr = float(hist_data[-1]["sumOpenInterest"])
+            if oi_prev > 0:
+                oi_change_pct = ((oi_curr - oi_prev) / oi_prev) * 100.0
+                logger.debug(
+                    "OI delta: prev=%.2f curr=%.2f chg=%.3f%%",
+                    oi_prev, oi_curr, oi_change_pct,
+                )
+    except Exception as oi_exc:
+        logger.debug("OI history fetch failed (non-critical): %s", oi_exc)
+
+    logger.debug("Fetched open interest: %.2f oi_chg=%.3f%%", open_interest, oi_change_pct)
     return open_interest, oi_change_pct
 
 

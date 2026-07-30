@@ -28,6 +28,10 @@ BASE_URL = "https://fapi.binance.com"
 _REQUEST_TIMEOUT = 8
 _CACHE_TTL = 300  # 5 minutes
 
+# Fix 3: forceOrders endpoint requires a signed Futures API key (HTTP 401 otherwise).
+# Until signed requests are implemented, skip gracefully to avoid 401 spam.
+_LIQ_ENABLED: bool = False  # Set True once signed Binance Futures API key is wired in
+
 # In-memory cache: symbol -> {"levels": [...], "fetched_at": float}
 _cache: dict[str, dict] = {}
 
@@ -67,6 +71,20 @@ def fetch_liquidation_levels(
     """
     bin_sym = _binance_symbol(symbol)
     now = time.time()
+
+    # Fix 3: forceOrders requires a signed API key — skip until credentials are wired.
+    if not _LIQ_ENABLED:
+        logger.debug("[LIQ] %s skipped — forceOrders requires signed Futures API key (set _LIQ_ENABLED=True when ready)", symbol)
+        return {
+            "symbol": symbol,
+            "current_price": current_price,
+            "clusters": [],
+            "nearest_long_liq": None,
+            "nearest_short_liq": None,
+            "dense_cluster_nearby": False,
+            "sweep_direction": None,
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+        }
 
     # Check cache
     cached = _cache.get(bin_sym)
